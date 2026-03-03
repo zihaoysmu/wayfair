@@ -12,121 +12,36 @@ library(tigris)
 library(ggplot2)
 library(stringr)
 library(aod)
+library(units)
+library(data.table)
+library(scales)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(maps)
+library(ggrepel)
+options(tigris_use_cache = TRUE)
+
 
 
 # import raw data ----
-raw_cbp_2011 = read.csv("C:/document/SMU PhD/research/Data/County Business Pattern/cbp11co.txt")
-raw_cbp_2012 = read.csv("C:/document/SMU PhD/research/Data/County Business Pattern/cbp12co.txt")
-raw_cbp_2013 = read.csv("C:/document/SMU PhD/research/Data/County Business Pattern/cbp13co.txt")
-raw_cbp_2014 = read.csv("C:/document/SMU PhD/research/Data/County Business Pattern/cbp14co.txt")
-raw_cbp_2015 = read.csv("C:/document/SMU PhD/research/Data/County Business Pattern/CBP2015.CB1500CBP-Data.csv")
-raw_cbp_2016 = read.csv("C:/document/SMU PhD/research/Data/County Business Pattern/CBP2016.CB1600CBP-Data.csv")
-raw_cbp_2017 = read.csv("C:/document/SMU PhD/research/Data/County Business Pattern/CBP2017.CB1700CBP-Data.csv")
-raw_cbp_2018 = read.csv("C:/document/SMU PhD/research/Data/County Business Pattern/CBP2018.CB1800CBP-Data.csv")
-raw_cbp_2019 = read.csv("C:/document/SMU PhD/research/Data/County Business Pattern/CBP2019.CB1900CBP-Data.csv")
-raw_cbp_2020 = read.csv("C:/document/SMU PhD/research/Data/County Business Pattern/CBP2020.CB2000CBP-Data.csv")
-raw_cbp_2021 = read.csv("C:/document/SMU PhD/research/Data/County Business Pattern/CBP2021.CB2100CBP-Data.csv")
-raw_cbp_2022 = read.csv("C:/document/SMU PhD/research/Data/County Business Pattern/CBP2022.CB2200CBP-Data.csv")
+gdp = read.csv("../data/temp/gdp_temp.csv", colClasses = c(GEO_ID = "character"))
+cbp = read.csv("../data/temp/cbp_temp.csv", colClasses = c(GEO_ID = "character"))
+market = read.csv("../data/temp/market_temp.csv", colClasses = c(GEOID_i = "character"))
+state = read.csv("../data/temp/state_con_tax.csv")
 raw_pop = read_xlsx("C:/document/SMU PhD/research/Data/Census Population Estimates Program/co-est2020int-pop.xlsx")
 
-# clean data before 2015 ----
-name_map2 = raw_cbp_2015 %>%
-  select(GEO_ID, NAME) %>%
-  filter(!is.na(NAME)) %>%
-  distinct() %>% 
-  mutate(GEO_ID = str_sub(GEO_ID, -5, -1))
-name_map2 = name_map2[-1,]
-
-cbp_2011 = raw_cbp_2011 %>% 
-  mutate(GEO_ID = sprintf("%02d%03d", fipstate, fipscty)) %>% 
-  complete(GEO_ID, naics = "4541//", fill = list(est = 0)) %>% 
-  mutate(YEAR = 2011) %>% 
-  filter(naics == "4541//") %>% 
-  rename(NAICS = naics, ESTAB = est) %>% 
-  select(NAICS, YEAR, ESTAB, GEO_ID) %>% 
-  left_join(name_map2, by = "GEO_ID")
-
-cbp_2012 = raw_cbp_2012 %>% 
-  mutate(GEO_ID = sprintf("%02d%03d", fipstate, fipscty)) %>% 
-  complete(GEO_ID, naics = "4541//", fill = list(est = 0)) %>% 
-  mutate(YEAR = 2012) %>% 
-  filter(naics == "4541//") %>% 
-  rename(NAICS = naics, ESTAB = est) %>% 
-  select(NAICS, YEAR, ESTAB, GEO_ID) %>% 
-  left_join(name_map2, by = "GEO_ID")
-
-cbp_2013 = raw_cbp_2013 %>% 
-  mutate(GEO_ID = sprintf("%02d%03d", fipstate, fipscty)) %>% 
-  complete(GEO_ID, naics = "4541//", fill = list(est = 0)) %>% 
-  mutate(YEAR = 2013) %>% 
-  filter(naics == "4541//") %>% 
-  rename(NAICS = naics, ESTAB = est) %>% 
-  select(NAICS, YEAR, ESTAB, GEO_ID) %>% 
-  left_join(name_map2, by = "GEO_ID")
-
-cbp_2014 = raw_cbp_2014 %>% 
-  mutate(GEO_ID = sprintf("%02d%03d", fipstate, fipscty)) %>% 
-  complete(GEO_ID, naics = "4541//", fill = list(est = 0)) %>% 
-  mutate(YEAR = 2014) %>% 
-  filter(naics == "4541//") %>% 
-  rename(NAICS = naics, ESTAB = est) %>% 
-  select(NAICS, YEAR, ESTAB, GEO_ID) %>% 
-  left_join(name_map2, by = "GEO_ID")
-
-
-
-# construct index ----
-name_map = raw_cbp_2015 %>%
-  select(GEO_ID, NAME) %>%
-  filter(!is.na(NAME)) %>%
-  distinct()
-
-year = 2015:2022
-
-# clean cbp ----
-cbp_list <- list(
-  raw_cbp_2015,
-  raw_cbp_2016,
-  raw_cbp_2017,
-  raw_cbp_2018,
-  raw_cbp_2019,
-  raw_cbp_2020,
-  raw_cbp_2021,
-  raw_cbp_2022
-)
-
-cbp_list <- lapply(cbp_list, function(df) {
-  df %>% mutate(ESTAB = as.numeric(ESTAB)) %>% 
-  rename_with(~ "NAICS", matches("^NAICS20[0-9]{2}$")) %>%
-  rename_with(~ "NAICS_LABEL", matches("^NAICS20[0-9]{2}_LABEL$")) %>% 
-  filter(EMPSZES_LABEL == "All establishments") %>% 
-  complete(GEO_ID,YEAR, NAICS = "4541", fill = list(ESTAB = 0)) %>% 
-  filter(NAICS == "4541") %>% 
-  select(GEO_ID, NAME, YEAR, NAICS, ESTAB) %>% 
-  left_join(name_map, by = "GEO_ID", suffix = c("", "_map")) %>% 
-  mutate(NAME = coalesce(NAME, NAME_map)) %>% 
-  select(-NAME_map)
-})
-
-cbp_list <- Map(function(df, year) {
-  df %>% mutate(YEAR = year)
-}, cbp_list, year)
-
-cbp = bind_rows(cbp_list)
-cbp = na.omit(cbp)
 
 # mark border county ----
-options(tigris_use_cache = TRUE)
-
-# 1) 读 county 边界（建议用 cartographic boundary 更轻）
+# 1)读county边界
 cty <- counties(cb = TRUE, year = 2022, class = "sf") %>%
-  st_transform(5070) %>%  # US Albers，适合邻接/距离判断
+  st_transform(5070) %>%  # 把坐标系换为美国专用的投影坐标系（单位：米）
   select(GEOID, STATEFP, NAME)
 
-# 2) 建立邻接关系（touches: 共享边或点）
-nb <- st_touches(cty)  # list: 每个 county 的邻居 index
 
-# 3) 判断是否存在“跨州邻居”
+# 2)建立邻接关系（touches:共享边或点）
+nb <- st_touches(cty)  # list: 每个county的邻居index
+
+# 3)判断是否存在“跨州邻居”
 boundary <- vapply(seq_len(nrow(cty)), function(i) {
   nbr <- nb[[i]]
   if (length(nbr) == 0) return(FALSE)
@@ -135,87 +50,178 @@ boundary <- vapply(seq_len(nrow(cty)), function(i) {
 
 cty$is_boundary_county = boundary
 
-# border county graph
-# ggplot(cty) +
-#   geom_sf(aes(fill = is_boundary_county), color = NA) +
-#   scale_fill_manual(
-#     values = c("FALSE" = "grey85", "TRUE" = "red"),
-#     labels = c("Interior county", "Boundary county"),
-#     name = ""
-#   ) +
-#   theme_void() +
-#   labs(title = "Boundary Counties in the United States")
+# 4)costalline
+coastline <- ne_download(
+  scale = "medium",
+  type = "coastline",
+  category = "physical",
+  returnclass = "sf"
+)
+coastline <- st_transform(coastline, st_crs(cty))
+
+# 5)international boundary
+countries <- ne_countries(scale = "medium", returnclass = "sf")
+
+usa <- countries %>%
+  filter(admin == "United States of America")
+
+neighbors <- countries %>%
+  filter(admin %in% c("Canada", "Mexico"))
+
+# border line = intersection boundary
+border_line <- st_intersection(
+  st_boundary(usa),
+  st_boundary(neighbors)
+) 
+border_line = st_transform(border_line, st_crs(cty))
+
+# 6)costal indicator
+cty$coastal <- as.integer(
+  lengths(st_intersects(cty, coastline)) > 0
+)
+
+# 7)international indicator 
+cty$border <- as.integer(
+  lengths(st_intersects(cty, border_line)) > 0
+)
 
 
-cbp_border = cbp %>% 
-  mutate(GEO_ID = str_sub(GEO_ID, -5, -1)) %>% 
-  left_join(cty %>% select(GEOID,is_boundary_county, STATEFP), by = c("GEO_ID" = "GEOID")) %>% 
+# establishment graph pre ----
+counties_sf <- counties(cb = TRUE, resolution = "20m", year = 2020) %>% 
+  rename(GEO_ID = GEOID)
+states_sf   <- states(cb = TRUE, resolution = "20m", year = 2020)
+
+exclude <- c("02", "15", "60", "66", "69", "72", "78")
+
+counties_sf <- counties_sf %>%
+  filter(!STATEFP %in% exclude)
+
+states_sf <- states_sf %>%
+  filter(!STATEFP %in% exclude)
+
+# 美国前五十大城市
+cities50 <- maps::us.cities %>%
+  as_tibble() %>%
+  arrange(desc(pop)) %>%
+  slice(1:50) %>%
+  transmute(city = name, pop, lon = long, lat = lat) %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+
+cities50 <- st_transform(cities50, st_crs(cty))
+xy <- st_coordinates(cities50)
+cities50_df <- cities50 %>%
+  st_drop_geometry() %>%
+  mutate(x = xy[,1], y = xy[,2])
+
+rm(coastline, countries, border_line, nb, neighbors, usa)
+
+
+# combine main ----
+main = cbp %>% 
+  left_join(cty %>% select(GEOID,is_boundary_county, STATEFP, coastal, border), by = c("GEO_ID" = "GEOID")) %>% 
   filter(STATEFP != 72) %>% 
-  mutate(lest = asinh(ESTAB))
+  left_join(gdp, by = c("YEAR" = "YEAR", "GEO_ID" = "GEO_ID")) %>% 
+  left_join(market, by = c("YEAR" = "year", "GEO_ID" = "GEOID_i")) %>% 
+  mutate(lest = asinh(ESTAB),
+         lma = log(ma),
+         lemp = asinh(EMP))
 
+# drop county with only one year obs
+main = main %>% 
+  group_by(GEO_ID) %>% 
+  filter(n() > 1) %>% 
+  ungroup()
+
+  
+# combine population and state consumption + tax ----
+pop = raw_pop
+pop$NAME = str_remove(pop$NAME, "^\\.")
+
+main = main %>% 
+  left_join(pop %>% select(NAME, `2018pop`), by = "NAME") %>% 
+  mutate(state = sub(".*,", "", NAME),
+         state = sub("^ ", "", state)) %>% 
+  left_join(state %>% select(state, year, expo, tax), by = c("state" = "state", "YEAR" = "year"))%>% 
+  drop_na() 
+
+
+# est graph after controlling market access ----
+resid_graph = main %>% 
+  filter(YEAR == 2017) %>% 
+  mutate(have_est = ifelse(ESTAB>0, 1, 0))
+
+est_emp = feols(lemp ~ lma + `2018pop` + coastal + border + is_boundary_county, data = resid_graph)
+est_est = feols(lest ~ lma + `2018pop` + coastal + border + is_boundary_county, data = resid_graph)
+
+resid_graph = resid_graph %>% 
+  mutate(resid_est = residuals(est_est),
+         resid_emp = residuals(est_emp))
+
+q_est <- quantile(resid_graph$resid_est, probs = c(.01, .99), na.rm = TRUE)
+q_emp = quantile(resid_graph$resid_emp, probs = c(.01, .99), na.rm = TRUE)
+
+resid_graph = resid_graph %>% 
+  mutate(resid_clip_est = pmin(pmax(resid_est, q_est[1]), q_est[2]),
+         resid_clip_emp = pmin(pmax(resid_emp, q_emp[1]), q_emp[2]),
+         top_est = ifelse(resid_clip_est > quantile(resid_clip_est, 0.9, na.rm = TRUE), 1, 0),
+         top_emp = ifelse(resid_clip_emp > quantile(resid_clip_emp, 0.9, na.rm = TRUE), 1, 0))
+
+map_resid = counties_sf %>% 
+  left_join(resid_graph, by = "GEO_ID")
+
+med_est = median(map_resid$resid_est, na.rm = TRUE)
+med_emp = median(map_resid$resid_emp, na.rm = TRUE)
+med2 = median(map_resid$lest, na.rm = TRUE)
+
+
+
+ggplot(map_resid) +
+  geom_sf(aes(fill = top_emp), color = NA) +
+  ggtitle("Top 10th EMP Resid County and Top 50 Big Cities, 2017")+
+  geom_sf(data = states_sf,
+          fill = NA,
+          color = "black",
+          size = 0.5)+
+  geom_sf(data = cities50, size = 0.5, color = "red") +
+  theme_void()
+ggsave("../output/emp_resid_17.png")
+
+
+#kansus city 地跨两州，但是税率高的county反而有更多的est
+#考虑港口、国外市场
+
+
+
+# regression ----
+
+# market + foreign state counties gdp x tax +foreign state counties gdp x tax x post 
+# + home state counties gdp x tax +home state counties gdp x tax x post
+# 分离在本州和外州的market
+# 扩大market radius
+# 写个模型 (见note)
+reg = feols(
+  lemp ~ coastal + border + lma + `2018pop` + tax+is_boundary_county|YEAR,
+  data = main,
+  cluster = ~STATEFP
+)
+summary(reg)
 
 
 # DiD ----
 
-cbp_border = cbp_border %>% 
+main = main %>% 
   mutate(time = YEAR-2019,
          treat = as.integer(is_boundary_county))
 
 did = feols(
    ESTAB~ i(time, treat, ref = -1) | GEO_ID + YEAR,
-  data = cbp_border,
+  data = main,
   cluster = ~STATEFP
 )
 
-# plot ----
-# plot = cbp_border %>% 
-#   filter(is_boundary_county == TRUE) %>% 
-#   group_by(YEAR) %>% 
-#   summarize(sum = sum(ESTAB))
-# 
-# ggplot(data = plot, aes(x = YEAR, y = sum))+
-#   geom_point()
-# 
-# nevada = cbp_border %>% 
-#   filter(STATEFP == 32, is_boundary_county == 1) %>% 
-#   group_by(YEAR) %>% 
-#   summarise(sum = sum(ESTAB))
-# 
-# ggplot(data = nevada, aes(x = YEAR, y = sum))+
-#   geom_point()
-
-# combine population ----
-pop = raw_pop
-pop$NAME = str_remove(pop$NAME, "^\\.")
-
-cbp_border = cbp_border %>% 
-  left_join(pop %>% select(NAME, `2018pop`), by = "NAME") %>% 
-  drop_na() %>% 
-  mutate(small = ifelse(`2018pop` < quantile(`2018pop`,0.9), 1, 0),
-         small2 = ifelse(`2018pop` < quantile(`2018pop`,0.5), 1, 0),
-         small3 = ifelse(`2018pop` < 50000, 1, 0),
-         treat_pop = treat*small,
-         treat_pop2 = treat*small2,
-         treat_pop3 = treat*small3,
-         post = ifelse(time>=0, 1, 0),
-         time2 = time+5)
-
-test = cbp_border %>%
-  select(GEO_ID, NAME, YEAR, ESTAB, treat, small, treat_pop) %>%
-  pivot_wider(
-    names_from = YEAR,
-    values_from = ESTAB,
-    names_prefix = "ESTAB_"
-  ) %>% 
-  mutate(dif = ESTAB_2020 - ESTAB_2017) %>% 
-  mutate(negative_change = ifelse(dif<0,1,0))
-summary(test$negative_change)
-summary(test %>% filter(treat_pop == 1) %>% pull(negative_change))
-summary(test %>% filter(treat_pop == 0) %>% pull(negative_change))
-
 did_pop = feols(
   ESTAB~ i(time, treat_pop, ref = -1)| GEO_ID + YEAR,
-  data = cbp_border,
+  data = main,
   cluster = ~STATEFP
 )
 
@@ -231,6 +237,53 @@ did_trend
 
 # when post is >=0, time trend dif at t=1 is -2.2+2*0.2 = -1.8, at t=2 is -1.4, at t=3 is -1, at t=4 is -0.6, 
 # at t=5 is -2.2+1.16-0.035*2*5=-1.39, t = 6 is -1.49
+
+# plot ----
+# plot = main %>% 
+#   filter(is_boundary_county == TRUE) %>% 
+#   group_by(YEAR) %>% 
+#   summarize(sum = sum(ESTAB))
+# 
+# ggplot(data = plot, aes(x = YEAR, y = sum))+
+#   geom_point()
+# 
+# nevada = main %>% 
+#   filter(STATEFP == 32, is_boundary_county == 1) %>% 
+#   group_by(YEAR) %>% 
+#   summarise(sum = sum(ESTAB))
+# 
+# ggplot(data = nevada, aes(x = YEAR, y = sum))+
+#   geom_point()
+
+
+# establishement graph ----
+
+
+map_df_22 <- counties_sf %>%
+  left_join(main, by = "GEO_ID") %>% 
+  mutate(group = cut(
+    ESTAB,
+    breaks = c(0, 10, 100, Inf),
+    labels = c("1–10", "10–100", "100+")
+  )) %>% 
+  filter(YEAR == 2022, small == 1)
+
+ggplot() +
+  geom_sf(data = map_df_22,
+          aes(fill = group),
+          color = "white",
+          size = 0.05) +
+  
+  geom_sf(data = states_sf,
+          fill = NA,
+          color = "black",
+          size = 0.5) +
+  
+  scale_fill_brewer(palette = "YlOrRd") +
+  
+  theme_void()
+ggsave("../output/estab_22.png")
+
 
 # export did parallel trend graph ----
 png("../output/did_pop_iplot.png", width = 800, height = 600, res = 150)
@@ -248,89 +301,3 @@ dev.off()
 etable(did_trend, file = "../output/did_trend.tex")
 
 # if using asinh, the coefficient is between 0.1 - 0.2. Most counties 
-
-# establishement graph ----
-options(tigris_use_cache = TRUE)
-
-counties_sf <- counties(cb = TRUE, resolution = "20m", year = 2020) %>% 
-  rename(GEO_ID = GEOID)
-states_sf   <- states(cb = TRUE, resolution = "20m", year = 2020)
-
-exclude <- c("02", "15", "60", "66", "69", "72", "78")
-
-counties_sf <- counties_sf %>%
-  filter(!STATEFP %in% exclude)
-
-states_sf <- states_sf %>%
-  filter(!STATEFP %in% exclude)
-
-map_df_16 <- counties_sf %>%
-  left_join(cbp_border, by = "GEO_ID") %>% 
-  mutate(group = cut(
-    ESTAB,
-    breaks = c(0, 10, 100, Inf),
-    labels = c("1–10", "10–100", "100+")
-  )) %>% 
-  filter(YEAR == 2016,small == 1)
-
-map_df_17 <- counties_sf %>%
-  left_join(cbp_border, by = "GEO_ID") %>% 
-  mutate(group = cut(
-    ESTAB,
-    breaks = c(0, 10, 100, Inf),
-    labels = c("1–10", "10–100", "100+")
-  )) %>% 
-  filter(YEAR == 2017,small == 1)
-
-map_df_22 <- counties_sf %>%
-  left_join(cbp_border, by = "GEO_ID") %>% 
-  mutate(group = cut(
-    ESTAB,
-    breaks = c(0, 10, 100, Inf),
-    labels = c("1–10", "10–100", "100+")
-  )) %>% 
-  filter(YEAR == 2022, small == 1)
-
-ggplot() +
-  geom_sf(data = map_df_16,
-          aes(fill = group),
-          color = "white",
-          size = 0.05) +
-  geom_sf(data = states_sf,
-          fill = NA,
-          color = "black",
-          size = 0.5) +
-  scale_fill_brewer(palette = "YlOrRd") +
-  labs(title = "Number of Establishements in Online Shopping Industry")+
-  theme_void()
-
-ggplot() +
-  geom_sf(data = map_df_17,
-          aes(fill = group),
-          color = "white",
-          size = 0.05) +
-  geom_sf(data = states_sf,
-          fill = NA,
-          color = "black",
-          size = 0.5) +
-  scale_fill_brewer(palette = "YlOrRd") +
-  labs(title = "Number of Establishements in Online Shopping Industry, 2017")+
-  theme_void()
-
-ggsave("../output/estab_17.png")
-
-ggplot() +
-  geom_sf(data = map_df_22,
-          aes(fill = group),
-          color = "white",
-          size = 0.05) +
-  
-  geom_sf(data = states_sf,
-          fill = NA,
-          color = "black",
-          size = 0.5) +
-  
-  scale_fill_brewer(palette = "YlOrRd") +
-  
-  theme_void()
-ggsave("../output/estab_22.png")
