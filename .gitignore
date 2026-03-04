@@ -3,3 +3,4 @@ other/
 output/
 
 # template from : https://github.com/github/gitignore/tree/main
+.Rproj.user

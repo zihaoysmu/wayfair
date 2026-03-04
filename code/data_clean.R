@@ -35,6 +35,7 @@ raw_IRPD = read.csv("../data/raw/IRPD.csv")
 raw_wayfair = read_xlsx("../data/raw/wayfair state implemetion timeline.xlsx")
 raw_CFS_2012 = read.csv("C:/document/SMU PhD/research/sales tax and immigration/Data/CFS/2012/CFSAREA2012.CF1200A30-Data.csv")
 raw_tax = read.csv("../data/temp/tax.csv")
+raw_tax_full = read_xlsx("../data/raw/combined sales tax.xlsx")
 
 # clean data before 2015 ----
 # # 加入更早的数据 does not add new info or conclusion
@@ -154,69 +155,19 @@ gdp = raw_gdp %>%
   select(GeoFIPS,year,gdp) %>% 
   rename(GEO_ID = GeoFIPS, YEAR = year)
 
-# county distance ----
-sf::sf_use_s2(TRUE)
+# clean tax_full ----
+data(fips_codes)
+state_crosswalk <- fips_codes %>%
+  distinct(state_name, state_code)
 
-# 1) county polygon
-cty_poly <- tigris::counties(cb = TRUE, year = 2022) %>%
-  st_transform(4326) %>%
-  select(GEOID)
-
-# 2) 用 polygon 生成点（更稳：point_on_surface）
-cty_pt <- cty_poly %>%
-  st_transform(5070) %>%                      # NAD83 / Conus Albers（米）
-  st_set_geometry(st_point_on_surface(st_geometry(.))) %>%
-  st_transform(4326)                          # 如果后面你想用球面距离，可再转回 4326
-
-# 3) 找 600km 内邻居（返回 index 列表）
-within_list <- st_is_within_distance(
-  cty_pt, cty_pt,
-  dist = units::set_units(600, "km")
-)
-
-# 4) index 长表
-pairs_idx <- rbindlist(lapply(seq_along(within_list), function(i) {
-  data.table(i = i, j = within_list[[i]])
-}))
-pairs_idx <- pairs_idx[i != j]
-
-# 5) 只对这些 pairs 算距离（by_element=TRUE）
-d_m <- st_distance(cty_pt[pairs_idx$i, ], cty_pt[pairs_idx$j, ], by_element = TRUE)
-
-pairs <- data.table(
-  GEOID_i = cty_pt$GEOID[pairs_idx$i],
-  GEOID_j = cty_pt$GEOID[pairs_idx$j],
-  dist_km = as.numeric(units::set_units(d_m, "km"))
-)
-rm(cty_poly, cty_pt, pairs_idx, d_m,within_list)
-
-
-# county market access ----
-market = pairs %>% 
-  left_join(gdp %>% 
-              pivot_wider(names_from = YEAR, values_from = gdp, names_prefix = "gdp_"), 
-            by = c("GEOID_j" = "GEO_ID")) %>% 
-  mutate(across(starts_with("gdp_"), ~ as.numeric(.x)),
-         across(starts_with("gdp_"), ~ .x / dist_km, .names = "gdp_div_dist_{.col}")) %>% 
-  select(GEOID_i,GEOID_j,gdp_div_dist_gdp_2015:gdp_div_dist_gdp_2022) %>% 
-  group_by(GEOID_i) %>% 
-  summarise(across(starts_with("gdp_div_dist_gdp_"), \(x) sum(x, na.rm = TRUE))) %>%
-  ungroup() %>% 
-  filter(gdp_div_dist_gdp_2015 != 0) %>% 
-  rename_with(~ paste0("ma_", sub("gdp_div_dist_gdp_", "", .x)),
-              starts_with("gdp_div_dist_gdp_")) %>% 
-  pivot_longer(cols = ma_2015:ma_2022,
-               names_to = "year",
-               values_to = "ma") %>% 
-  mutate(year = sub("ma_", "", year),
-         year = as.numeric(year))
-
-cbp = cbp %>% 
-  mutate(GEO_ID = str_sub(GEO_ID, -5, -1))
-
-
-
-
+tax_full = raw_tax_full %>% 
+  rename(state = ...1) %>% 
+  left_join(state_crosswalk, by = c("state" = "state_name")) %>% 
+  mutate(across(starts_with("tax"), as.numeric)) %>% 
+  pivot_longer(cols = tax_2012:tax_2022, names_to = "year", values_to = "tax") %>%
+  mutate(year = sub("tax_", "", year)) %>% 
+  drop_na()
+  
 
 
 
@@ -290,8 +241,110 @@ main = consumption %>%
          expo = tax*ronline / rcon) %>% 
   group_by(state) %>% 
   mutate(expo = expo[year == 2012]) %>% 
-  ungroup()
+  ungroup() %>% 
+  left_join(state_crosswalk, by = c("state" = "state_name"))
 
+
+
+# construct county distance ----
+sf::sf_use_s2(TRUE)
+
+# 1) county polygon
+cty_poly <- tigris::counties(cb = TRUE, year = 2022) %>%
+  st_transform(4326) %>%
+  select(GEOID)
+
+# 2) 用 polygon 生成点（更稳：point_on_surface）
+cty_pt <- cty_poly %>%
+  st_transform(5070) %>%                      # NAD83 / Conus Albers（米）
+  st_set_geometry(st_point_on_surface(st_geometry(.))) %>%
+  st_transform(4326)                          # 如果后面你想用球面距离，可再转回 4326
+
+# 3) 找 600km 内邻居（返回 index 列表）
+within_list <- st_is_within_distance(
+  cty_pt, cty_pt,
+  dist = units::set_units(600, "km")
+)
+
+# 4) index 长表
+pairs_idx <- rbindlist(lapply(seq_along(within_list), function(i) {
+  data.table(i = i, j = within_list[[i]])
+}))
+pairs_idx <- pairs_idx[i != j]
+
+# 5) 只对这些 pairs 算距离（by_element=TRUE）
+d_m <- st_distance(cty_pt[pairs_idx$i, ], cty_pt[pairs_idx$j, ], by_element = TRUE)
+
+pairs <- data.table(
+  GEOID_i = cty_pt$GEOID[pairs_idx$i],
+  GEOID_j = cty_pt$GEOID[pairs_idx$j],
+  dist_km = as.numeric(units::set_units(d_m, "km"))
+)
+rm(cty_poly, cty_pt, pairs_idx, d_m,within_list)
+
+
+# construct county market access ----
+
+# note: ma does not include county's own gdp
+
+market = pairs %>%
+  mutate(
+    state_i = str_sub(GEOID_i, 1, 2),
+    state_j = str_sub(GEOID_j, 1, 2),
+    same_state = (state_i == state_j)
+  ) %>%
+  left_join(
+    gdp %>%
+      pivot_wider(names_from = YEAR, values_from = gdp, names_prefix = "gdp_"),
+    by = c("GEOID_j" = "GEO_ID")
+  ) %>%
+  mutate(across(starts_with("gdp_"), as.numeric)) %>%
+  pivot_longer(
+    cols = starts_with("gdp_"),
+    names_to = "year",
+    values_to = "gdp_j"
+  ) %>% 
+  mutate(year = as.numeric(sub("gdp_", "", year)))
+market = market %>% 
+  left_join(tax_full %>% 
+              mutate(year = as.numeric(year)) %>% 
+              select(state_code, tax, year), by = c("state_j" = "state_code", "year" = "year"))
+
+market = market %>%   
+  mutate(
+    gdp_j = replace_na(gdp_j, 0),
+    gdp_j_tax = gdp_j * tax,
+    ma_contrib = gdp_j / dist_km
+  ) 
+market = market %>% 
+  group_by(GEOID_i, year, same_state) %>%
+  summarise(
+    gdp_sum = sum(gdp_j, na.rm = TRUE),
+    gdp_tax_sum = sum(gdp_j_tax, na.rm = TRUE),
+    ma_sum  = sum(ma_contrib, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(type = if_else(same_state, "in", "out")) %>%
+  select(GEOID_i, year, type, gdp_sum, gdp_tax_sum, ma_sum)
+
+market = market %>% 
+  pivot_wider(
+    names_from = type,
+    values_from = c(gdp_sum, gdp_tax_sum, ma_sum),
+    values_fill = 0
+  ) %>%
+  rename(
+    gdp_in  = gdp_sum_in,
+    gdp_out = gdp_sum_out,
+    gdp_tax_in = gdp_tax_sum_in,
+    gdp_tax_out = gdp_tax_sum_out,
+    ma_in   = ma_sum_in,
+    ma_out  = ma_sum_out
+  ) %>% 
+  filter((ma_in + ma_out) != 0) 
+
+cbp = cbp %>% 
+  mutate(GEO_ID = str_sub(GEO_ID, -5, -1))
 
 # output ----
 write.csv(cbp, "../data/temp/cbp_temp.csv", row.names = FALSE)

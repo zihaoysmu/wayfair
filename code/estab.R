@@ -117,32 +117,33 @@ rm(coastline, countries, border_line, nb, neighbors, usa)
 
 
 # combine main ----
+pop = raw_pop
+pop$NAME = str_remove(pop$NAME, "^\\.")
+
+#add back county's own gdp to gdp_in and ma_in
 main = cbp %>% 
   left_join(cty %>% select(GEOID,is_boundary_county, STATEFP, coastal, border), by = c("GEO_ID" = "GEOID")) %>% 
   filter(STATEFP != 72) %>% 
   left_join(gdp, by = c("YEAR" = "YEAR", "GEO_ID" = "GEO_ID")) %>% 
   left_join(market, by = c("YEAR" = "year", "GEO_ID" = "GEOID_i")) %>% 
   mutate(lest = asinh(ESTAB),
-         lma = log(ma),
-         lemp = asinh(EMP))
-
-# drop county with only one year obs
-main = main %>% 
-  group_by(GEO_ID) %>% 
-  filter(n() > 1) %>% 
-  ungroup()
-
-  
-# combine population and state consumption + tax ----
-pop = raw_pop
-pop$NAME = str_remove(pop$NAME, "^\\.")
-
-main = main %>% 
+         gdp = as.numeric(gdp),
+         ma_in = ma_in + gdp,
+         gdp_in = gdp + gdp_in,
+         lma_in = log(ma_in),
+         lma_out = asinh(ma_out),
+         lemp = asinh(EMP)) %>% 
   left_join(pop %>% select(NAME, `2018pop`), by = "NAME") %>% 
   mutate(state = sub(".*,", "", NAME),
          state = sub("^ ", "", state)) %>% 
-  left_join(state %>% select(state, year, expo, tax), by = c("state" = "state", "YEAR" = "year"))%>% 
-  drop_na() 
+  left_join(state %>% select(state, year, expo, tax), by = c("state" = "state", "YEAR" = "year"))
+
+# drop county with only one year obs and na
+main = main %>% 
+  group_by(GEO_ID) %>% 
+  filter(n() > 1) %>% 
+  ungroup() %>% 
+  drop_na()
 
 
 # est graph after controlling market access ----
@@ -150,8 +151,8 @@ resid_graph = main %>%
   filter(YEAR == 2017) %>% 
   mutate(have_est = ifelse(ESTAB>0, 1, 0))
 
-est_emp = feols(lemp ~ lma + `2018pop` + coastal + border + is_boundary_county, data = resid_graph)
-est_est = feols(lest ~ lma + `2018pop` + coastal + border + is_boundary_county, data = resid_graph)
+est_emp = feols(lemp ~ lma_in + lma_out + `2018pop` + coastal + border + is_boundary_county, data = resid_graph)
+est_est = feols(lest ~ lma_in + lma_out + `2018pop` + coastal + border + is_boundary_county, data = resid_graph)
 
 resid_graph = resid_graph %>% 
   mutate(resid_est = residuals(est_est),
@@ -168,12 +169,6 @@ resid_graph = resid_graph %>%
 
 map_resid = counties_sf %>% 
   left_join(resid_graph, by = "GEO_ID")
-
-med_est = median(map_resid$resid_est, na.rm = TRUE)
-med_emp = median(map_resid$resid_emp, na.rm = TRUE)
-med2 = median(map_resid$lest, na.rm = TRUE)
-
-
 
 ggplot(map_resid) +
   geom_sf(aes(fill = top_emp), color = NA) +
@@ -196,11 +191,12 @@ ggsave("../output/emp_resid_17.png")
 
 # market + foreign state counties gdp x tax +foreign state counties gdp x tax x post 
 # + home state counties gdp x tax +home state counties gdp x tax x post
-# 分离在本州和外州的market
+# 分离在本州和外州的gdp sum √
+# 收集tax数据，构建每个county x tax的数据
 # 扩大market radius
-# 写个模型 (见note)
+# 写个模型 (见note) √
 reg = feols(
-  lemp ~ coastal + border + lma + `2018pop` + tax+is_boundary_county|YEAR,
+  lemp ~ coastal + border + `2018pop` + lma_in + lma_out +  |YEAR,
   data = main,
   cluster = ~STATEFP
 )
