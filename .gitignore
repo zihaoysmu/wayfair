@@ -1,6 +1,8 @@
 data/
 other/
 output/
+.Rhistory
+.Rproj.user/
 
 # template from : https://github.com/github/gitignore/tree/main
 .Rproj.user
