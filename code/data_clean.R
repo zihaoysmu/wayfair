@@ -161,7 +161,7 @@ state_crosswalk <- fips_codes %>%
   distinct(state_name, state_code)
 
 tax_full = raw_tax_full %>% 
-  rename(state = ...1) %>% 
+  rename(state = GEO_ID) %>% 
   left_join(state_crosswalk, by = c("state" = "state_name")) %>% 
   mutate(across(starts_with("tax"), as.numeric)) %>% 
   pivot_longer(cols = tax_2012:tax_2022, names_to = "year", values_to = "tax") %>%

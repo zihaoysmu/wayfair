@@ -29,6 +29,7 @@ cbp = read.csv("../data/temp/cbp_temp.csv", colClasses = c(GEO_ID = "character")
 market = read.csv("../data/temp/market_temp.csv", colClasses = c(GEOID_i = "character"))
 state = read.csv("../data/temp/state_con_tax.csv")
 raw_pop = read_xlsx("C:/document/SMU PhD/research/Data/Census Population Estimates Program/co-est2020int-pop.xlsx")
+tax = read_xlsx("../data/raw/combined sales tax.xlsx")
 
 
 # mark border county ----
@@ -86,7 +87,9 @@ cty$border <- as.integer(
 )
 
 
-# establishment graph pre ----
+# Establishment graph preparation ----
+
+# Generate counties and states
 counties_sf <- counties(cb = TRUE, resolution = "20m", year = 2020) %>% 
   rename(GEO_ID = GEOID)
 states_sf   <- states(cb = TRUE, resolution = "20m", year = 2020)
@@ -99,7 +102,7 @@ counties_sf <- counties_sf %>%
 states_sf <- states_sf %>%
   filter(!STATEFP %in% exclude)
 
-# 美国前五十大城市
+# Top 50 big cities in the US
 cities50 <- maps::us.cities %>%
   as_tibble() %>%
   arrange(desc(pop)) %>%
@@ -113,7 +116,38 @@ cities50_df <- cities50 %>%
   st_drop_geometry() %>%
   mutate(x = xy[,1], y = xy[,2])
 
-rm(coastline, countries, border_line, nb, neighbors, usa)
+# Generate distance to border and which border the county belongs to
+states_pre <- states_sf %>% 
+  select(STUSPS, STATEFP, NAME) %>% 
+  st_transform(5070)
+state_border <- st_intersection(states_pre, states_pre) %>% 
+  filter(STUSPS != STUSPS.1) %>% 
+  mutate(
+    border_name = paste0(
+      pmin(STUSPS, STUSPS.1),
+      "-",
+      pmax(STUSPS, STUSPS.1)
+    )
+  ) %>% 
+  group_by(border_name) %>% 
+  summarize(geometry = st_union(geometry), .groups = "drop")
+
+counties_sf  <- st_transform(counties_sf, 5070)
+state_border <- st_transform(state_border, 5070)
+
+county_cent <- st_centroid(counties_sf)
+nearest_id <- st_nearest_feature(county_cent, state_border)
+
+nearest_pts <- st_nearest_points(
+  county_cent,
+  state_border[nearest_id, ],
+  pairwise = TRUE
+)
+
+counties_sf$dist_to_border <- as.numeric(st_length(nearest_pts))
+counties_sf$nearest_border <- state_border$border_name[nearest_id]
+
+rm(coastline, countries, border_line, nb, neighbors, usa, states_pre)
 
 
 # combine main ----
@@ -132,7 +166,9 @@ main = cbp %>%
          gdp_in = gdp + gdp_in,
          lma_in = log(ma_in),
          lma_out = asinh(ma_out),
-         lemp = asinh(EMP)) %>% 
+         lemp = asinh(EMP),
+         lgdp_tax_in = asinh(gdp_tax_in),
+         lgdp_tax_out = asinh(gdp_tax_out)) %>% 
   left_join(pop %>% select(NAME, `2018pop`), by = "NAME") %>% 
   mutate(state = sub(".*,", "", NAME),
          state = sub("^ ", "", state)) %>% 
@@ -151,8 +187,8 @@ resid_graph = main %>%
   filter(YEAR == 2017) %>% 
   mutate(have_est = ifelse(ESTAB>0, 1, 0))
 
-est_emp = feols(lemp ~ lma_in + lma_out + `2018pop` + coastal + border + is_boundary_county, data = resid_graph)
-est_est = feols(lest ~ lma_in + lma_out + `2018pop` + coastal + border + is_boundary_county, data = resid_graph)
+est_emp = feols(lemp ~ lma_in + lma_out + coastal + border, data = resid_graph)
+est_est = feols(lest ~ lma_in + lma_out + coastal + border, data = resid_graph)
 
 resid_graph = resid_graph %>% 
   mutate(resid_est = residuals(est_est),
@@ -181,6 +217,7 @@ ggplot(map_resid) +
   theme_void()
 ggsave("../output/emp_resid_17.png")
 
+rm(cities50, cities50_df)
 
 #kansus city 地跨两州，但是税率高的county反而有更多的est
 #考虑港口、国外市场
@@ -196,89 +233,44 @@ ggsave("../output/emp_resid_17.png")
 # 扩大market radius
 # 写个模型 (见note) √
 reg = feols(
-  lemp ~ coastal + border + `2018pop` + lma_in + lma_out +  |YEAR,
-  data = main,
-  cluster = ~STATEFP
-)
-summary(reg)
-
-
-# DiD ----
-
-main = main %>% 
-  mutate(time = YEAR-2019,
-         treat = as.integer(is_boundary_county))
-
-did = feols(
-   ESTAB~ i(time, treat, ref = -1) | GEO_ID + YEAR,
+  lemp ~ 
+  lma_in + lma_out + lgdp_tax_in + lgdp_tax_in * I(YEAR >= 2019) + lgdp_tax_out + lgdp_tax_out * I(YEAR >= 2019) |YEAR + GEO_ID ,
   data = main,
   cluster = ~STATEFP
 )
 
-did_pop = feols(
-  ESTAB~ i(time, treat_pop, ref = -1)| GEO_ID + YEAR,
-  data = main,
-  cluster = ~STATEFP
-)
-
-iplot(did_pop)
-
-did_trend = feols(
-  ESTAB ~ treat_pop:time2+ treat_pop:time2^2 + treat_pop:post:time2
-  | GEO_ID + YEAR,
-  cluster = ~STATEFP,
-  data = test
-)
-did_trend
-
-# when post is >=0, time trend dif at t=1 is -2.2+2*0.2 = -1.8, at t=2 is -1.4, at t=3 is -1, at t=4 is -0.6, 
-# at t=5 is -2.2+1.16-0.035*2*5=-1.39, t = 6 is -1.49
-
-# plot ----
-# plot = main %>% 
-#   filter(is_boundary_county == TRUE) %>% 
-#   group_by(YEAR) %>% 
-#   summarize(sum = sum(ESTAB))
-# 
-# ggplot(data = plot, aes(x = YEAR, y = sum))+
-#   geom_point()
-# 
-# nevada = main %>% 
-#   filter(STATEFP == 32, is_boundary_county == 1) %>% 
-#   group_by(YEAR) %>% 
-#   summarise(sum = sum(ESTAB))
-# 
-# ggplot(data = nevada, aes(x = YEAR, y = sum))+
-#   geom_point()
 
 
-# establishement graph ----
+# border density graph ----
+# hard to decide which county belongs to which border
+
+# clean tax data
+tax17 <- tax %>% 
+  select(tax_2017, GEO_ID)
+tax17$state_abbr <- state.abb[match(tax17$GEO_ID, state.name)]
+
+# combine density df
+density <- resid_graph %>% 
+  select(GEO_ID, NAME, YEAR, resid_clip_emp, state) %>% 
+  left_join(counties_sf %>% select(GEO_ID, dist_to_border, nearest_border), by = "GEO_ID") %>% 
+  drop_na() %>% # exclude alaska and hawaii
+  separate(nearest_border, into = c("state1", "state2"), sep = "-")
+density$state_home <- state.abb[match(density$state, state.name)]
+density <- density %>% 
+  mutate(state_other = ifelse(state1 == state_home, state2, state1)) %>% 
+  select(-state1, -state2) %>% 
+  left_join(tax17 %>% select(-GEO_ID), by = c("state_home" = "state_abbr")) %>% 
+  rename(tax_home = tax_2017) %>%
+  left_join(tax17 %>% select(-GEO_ID), by = c("state_other" = "state_abbr")) %>% 
+  rename(tax_other = tax_2017) %>% 
+  mutate(high_side = ifelse(tax_home > tax_other, 1, -1),
+         dist_to_border_adj = dist_to_border * high_side)
+
+ggplot(density, aes(x = dist_to_border_adj, y = resid_clip_emp)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth()
 
 
-map_df_22 <- counties_sf %>%
-  left_join(main, by = "GEO_ID") %>% 
-  mutate(group = cut(
-    ESTAB,
-    breaks = c(0, 10, 100, Inf),
-    labels = c("1–10", "10–100", "100+")
-  )) %>% 
-  filter(YEAR == 2022, small == 1)
-
-ggplot() +
-  geom_sf(data = map_df_22,
-          aes(fill = group),
-          color = "white",
-          size = 0.05) +
-  
-  geom_sf(data = states_sf,
-          fill = NA,
-          color = "black",
-          size = 0.5) +
-  
-  scale_fill_brewer(palette = "YlOrRd") +
-  
-  theme_void()
-ggsave("../output/estab_22.png")
 
 
 # export did parallel trend graph ----
