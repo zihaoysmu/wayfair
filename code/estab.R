@@ -19,273 +19,414 @@ library(rnaturalearth)
 library(rnaturalearthdata)
 library(maps)
 library(ggrepel)
+library(lintr)
+library(languageserver)
+library(tidycensus)
 options(tigris_use_cache = TRUE)
-
+options(error = traceback)
 
 
 # import raw data ----
-gdp = read.csv("../data/temp/gdp_temp.csv", colClasses = c(GEO_ID = "character"))
-cbp = read.csv("../data/temp/cbp_temp.csv", colClasses = c(GEO_ID = "character"))
-market = read.csv("../data/temp/market_temp.csv", colClasses = c(GEOID_i = "character"))
-state = read.csv("../data/temp/state_con_tax.csv")
-raw_pop = read_xlsx("C:/document/SMU PhD/research/Data/Census Population Estimates Program/co-est2020int-pop.xlsx")
-tax = read_xlsx("../data/raw/combined sales tax.xlsx")
+    gdp <- read.csv("data/temp/gdp_temp.csv", colClasses = c(GEO_ID = "character"))
+    cbp <- read.csv("data/temp/cbp_temp.csv", colClasses = c(GEO_ID = "character")) 
+    market <- read.csv("data/temp/market_temp.csv", colClasses = c(GEOID_i = "character")) 
+    state <- read.csv("data/temp/state_con_tax.csv") 
+    raw_pop <- read_xlsx("C:/document/SMU PhD/research/Data/Census Population Estimates Program/co-est2020int-pop.xlsx") 
+    tax_raw <- read_xlsx("data/raw/combined sales tax.xlsx") 
+    cit_raw <- read_xlsx("data/raw/us_state_corporate_tax.xlsx")
+    data("fips_codes")
 
+# clean state tax data ----
+    state_crosswalk <- fips_codes %>%
+        distinct(state_name, state_code)
 
-# mark border county ----
-# 1)读county边界
-cty <- counties(cb = TRUE, year = 2022, class = "sf") %>%
-  st_transform(5070) %>%  # 把坐标系换为美国专用的投影坐标系（单位：米）
-  select(GEOID, STATEFP, NAME)
+    tax <- tax_raw %>%
+        rename(state = GEO_ID) %>%
+        left_join(state_crosswalk, by = c("state" = "state_name")) %>%
+        mutate(across(starts_with("tax_"), as.numeric)) %>%
+        pivot_longer(
+            cols = starts_with("tax_"),
+            names_to = "tax_year",
+            values_to = "sales_tax"
+        ) %>%
+        mutate(YEAR = as.integer(str_remove(tax_year, "^tax_"))) %>%
+        filter(!is.na(state_code)) %>%
+        select(state, state_code, YEAR, sales_tax)
 
+    cit <- cit_raw %>%
+        rename(state = state_name, state_abbr = abbrev) %>%
+        pivot_longer(
+            cols = starts_with("corporate_tax_"),
+            names_to = "cit_year",
+            values_to = "cit"
+        ) %>%
+        mutate(YEAR = as.integer(str_remove(cit_year, "^corporate_tax_"))) %>%
+        filter(!is.na(state_abbr)) %>%
+        select(state, state_abbr, YEAR, cit)
+# clean population data ----
 
-# 2)建立邻接关系（touches:共享边或点）
-nb <- st_touches(cty)  # list: 每个county的邻居index
+    pop <- raw_pop
+    pop$NAME <- str_remove(pop$NAME, "^\\.")
+    pop <- pop %>% 
+        separate(NAME, c("county", "state"), sep = ", ") %>% 
+        left_join(fips_codes %>% select(state_code, state_name, county_code, county), by = c("state" = "state_name", "county" = "county")) %>%
+        mutate(GEO_ID = paste0(state_code, county_code)) %>% 
+        drop_na()
 
-# 3)判断是否存在“跨州邻居”
-boundary <- vapply(seq_len(nrow(cty)), function(i) {
-  nbr <- nb[[i]]
-  if (length(nbr) == 0) return(FALSE)
-  any(cty$STATEFP[nbr] != cty$STATEFP[i])
-}, logical(1))
+# generate cty df ----
+    # 1)读county边界
+    cty <- counties(cb = TRUE, year = 2022, class = "sf") %>%
+        st_transform(5070) %>%  # 把坐标系换为美国专用的投影坐标系（单位：米）
+        select(GEOID, STATEFP, NAME)
+    # 2)建立邻接关系（touches:共享边或点）
+    nb <- st_touches(cty)  # list: 每个county的邻居index
+    # 3)判断是否存在“跨州邻居”
+    boundary <- vapply(seq_len(nrow(cty)), function(i) {
+        nbr <- nb[[i]]
+        if (length(nbr) == 0) return(FALSE)
+        any(cty$STATEFP[nbr] != cty$STATEFP[i])
+    }, logical(1))
+    cty$is_boundary_county = boundary
+    # 4)costalline
+    coastline <- ne_download(
+        scale = "medium",
+        type = "coastline",
+        category = "physical",
+        returnclass = "sf"
+    )
+    coastline <- st_transform(coastline, st_crs(cty))
+    # 5)international boundary
+    countries <- ne_countries(scale = "medium", returnclass = "sf")
+    usa <- countries %>%
+        filter(admin == "United States of America")
+    neighbors <- countries %>%
+        filter(admin %in% c("Canada", "Mexico"))
+        # border line = intersection boundary
+        border_line <- st_intersection(
+        st_boundary(usa),
+        st_boundary(neighbors)
+        ) 
+        border_line = st_transform(border_line, st_crs(cty))
+    # 6)costal indicator
+    cty$coastal <- as.integer(
+        lengths(st_intersects(cty, coastline)) > 0
+    )
+    # 7)international indicator 
+    cty$border <- as.integer(
+        lengths(st_intersects(cty, border_line)) > 0
+    )
 
-cty$is_boundary_county = boundary
-
-# 4)costalline
-coastline <- ne_download(
-  scale = "medium",
-  type = "coastline",
-  category = "physical",
-  returnclass = "sf"
-)
-coastline <- st_transform(coastline, st_crs(cty))
-
-# 5)international boundary
-countries <- ne_countries(scale = "medium", returnclass = "sf")
-
-usa <- countries %>%
-  filter(admin == "United States of America")
-
-neighbors <- countries %>%
-  filter(admin %in% c("Canada", "Mexico"))
-
-# border line = intersection boundary
-border_line <- st_intersection(
-  st_boundary(usa),
-  st_boundary(neighbors)
-) 
-border_line = st_transform(border_line, st_crs(cty))
-
-# 6)costal indicator
-cty$coastal <- as.integer(
-  lengths(st_intersects(cty, coastline)) > 0
-)
-
-# 7)international indicator 
-cty$border <- as.integer(
-  lengths(st_intersects(cty, border_line)) > 0
-)
-
+    cty = cty %>% 
+        left_join(pop %>% select(GEO_ID, `2018pop`, state), by = c("GEOID" = "GEO_ID"))
 
 # Establishment graph preparation ----
+    # Generate counties and states
+    counties_sf <- counties(cb = TRUE, resolution = "20m", year = 2020) %>% 
+        rename(GEO_ID = GEOID)
+    states_sf   <- states(cb = TRUE, resolution = "20m", year = 2020)
 
-# Generate counties and states
-counties_sf <- counties(cb = TRUE, resolution = "20m", year = 2020) %>% 
-  rename(GEO_ID = GEOID)
-states_sf   <- states(cb = TRUE, resolution = "20m", year = 2020)
+    exclude <- c("02", "15", "60", "66", "69", "72", "78")
 
-exclude <- c("02", "15", "60", "66", "69", "72", "78")
+    counties_sf <- counties_sf %>%
+        filter(!STATEFP %in% exclude)
 
-counties_sf <- counties_sf %>%
-  filter(!STATEFP %in% exclude)
+    states_sf <- states_sf %>%
+        filter(!STATEFP %in% exclude)
 
-states_sf <- states_sf %>%
-  filter(!STATEFP %in% exclude)
+    # Generate distance to border and which border the county belongs to
+    states_pre <- states_sf %>% 
+        select(STUSPS, STATEFP, NAME) %>% 
+        st_transform(5070)
+    state_border <- st_intersection(states_pre, states_pre) %>% 
+        filter(STUSPS != STUSPS.1) %>% 
+        mutate(
+        border_name = paste0(
+            pmin(STUSPS, STUSPS.1),
+            "-",
+            pmax(STUSPS, STUSPS.1)
+        )
+        ) %>% 
+        group_by(border_name) %>% 
+        summarize(geometry = st_union(geometry), .groups = "drop")
 
-# Top 50 big cities in the US
-cities50 <- maps::us.cities %>%
-  as_tibble() %>%
-  arrange(desc(pop)) %>%
-  slice(1:50) %>%
-  transmute(city = name, pop, lon = long, lat = lat) %>%
-  st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+    counties_sf  <- st_transform(counties_sf, 5070)
+    state_border <- st_transform(state_border, 5070)
 
-cities50 <- st_transform(cities50, st_crs(cty))
-xy <- st_coordinates(cities50)
-cities50_df <- cities50 %>%
-  st_drop_geometry() %>%
-  mutate(x = xy[,1], y = xy[,2])
+    county_cent <- st_centroid(counties_sf)
+    nearest_id <- st_nearest_feature(county_cent, state_border)
 
-# Generate distance to border and which border the county belongs to
-states_pre <- states_sf %>% 
-  select(STUSPS, STATEFP, NAME) %>% 
-  st_transform(5070)
-state_border <- st_intersection(states_pre, states_pre) %>% 
-  filter(STUSPS != STUSPS.1) %>% 
-  mutate(
-    border_name = paste0(
-      pmin(STUSPS, STUSPS.1),
-      "-",
-      pmax(STUSPS, STUSPS.1)
+    nearest_pts <- st_nearest_points(
+        county_cent,
+        state_border[nearest_id, ],
+        pairwise = TRUE
     )
-  ) %>% 
-  group_by(border_name) %>% 
-  summarize(geometry = st_union(geometry), .groups = "drop")
 
-counties_sf  <- st_transform(counties_sf, 5070)
-state_border <- st_transform(state_border, 5070)
+    counties_sf$dist_to_border <- as.numeric(st_length(nearest_pts))
+    counties_sf$nearest_border <- state_border$border_name[nearest_id]
 
-county_cent <- st_centroid(counties_sf)
-nearest_id <- st_nearest_feature(county_cent, state_border)
-
-nearest_pts <- st_nearest_points(
-  county_cent,
-  state_border[nearest_id, ],
-  pairwise = TRUE
-)
-
-counties_sf$dist_to_border <- as.numeric(st_length(nearest_pts))
-counties_sf$nearest_border <- state_border$border_name[nearest_id]
-
-rm(coastline, countries, border_line, nb, neighbors, usa, states_pre)
+    rm(coastline, countries, border_line, nb, neighbors, usa, states_pre)
 
 
 # combine main ----
-pop = raw_pop
-pop$NAME = str_remove(pop$NAME, "^\\.")
+    #add back county's own gdp to gdp_in and ma_in
+    main <- cbp %>% 
+    left_join(cty %>% select(GEOID, state, is_boundary_county, STATEFP, coastal, border, `2018pop`), by = c("GEO_ID" = "GEOID")) %>% 
+    filter(STATEFP != 72) %>% 
+    left_join(gdp, by = c("YEAR" = "YEAR", "GEO_ID" = "GEO_ID")) %>% 
+    left_join(market, by = c("YEAR" = "year", "GEO_ID" = "GEOID_i")) %>% 
+    mutate(lest = asinh(ESTAB),
+            gdp = as.numeric(gdp),
+            ma_in = ma_in + gdp,
+            gdp_in = gdp + gdp_in,
+            lma_in = log(ma_in),
+            lma_out = asinh(ma_out),
+            lemp = asinh(EMP),
+            lgdp_tax_in = asinh(gdp_tax_in),
+            lma_tax_in = asinh(ma_tax_in),
+            lma_tax_out = asinh(ma_tax_out),
+            lgdp_tax_out = asinh(gdp_tax_out)) %>% 
+    left_join(state %>% select(state, year, expo), by = c("state" = "state", "YEAR" = "year")) %>% 
+    left_join(tax %>% select(state, YEAR, sales_tax), by = c("state", "YEAR")) %>%
+    left_join(cit %>% select(state, YEAR, cit, state_abbr), by = c("state", "YEAR")) %>%
+    mutate(
+        type = ifelse(NAICS == "4541", "online", "local"),
+        state_abbr = coalesce(state_abbr, state.abb[match(state, state.name)])
+    )
 
-#add back county's own gdp to gdp_in and ma_in
-main = cbp %>% 
-  left_join(cty %>% select(GEOID,is_boundary_county, STATEFP, coastal, border), by = c("GEO_ID" = "GEOID")) %>% 
-  filter(STATEFP != 72) %>% 
-  left_join(gdp, by = c("YEAR" = "YEAR", "GEO_ID" = "GEO_ID")) %>% 
-  left_join(market, by = c("YEAR" = "year", "GEO_ID" = "GEOID_i")) %>% 
-  mutate(lest = asinh(ESTAB),
-         gdp = as.numeric(gdp),
-         ma_in = ma_in + gdp,
-         gdp_in = gdp + gdp_in,
-         lma_in = log(ma_in),
-         lma_out = asinh(ma_out),
-         lemp = asinh(EMP),
-         lgdp_tax_in = asinh(gdp_tax_in),
-         lgdp_tax_out = asinh(gdp_tax_out)) %>% 
-  left_join(pop %>% select(NAME, `2018pop`), by = "NAME") %>% 
-  mutate(state = sub(".*,", "", NAME),
-         state = sub("^ ", "", state)) %>% 
-  left_join(state %>% select(state, year, expo, tax), by = c("state" = "state", "YEAR" = "year"))
+    # drop county with only one year obs and na
+    main <- main %>% 
+    group_by(GEO_ID) %>% 
+    filter(n() > 1) %>% 
+    ungroup() %>% 
+    drop_na()
 
-# drop county with only one year obs and na
-main = main %>% 
-  group_by(GEO_ID) %>% 
-  filter(n() > 1) %>% 
-  ungroup() %>% 
-  drop_na()
-
-
-# est graph after controlling market access ----
-resid_graph = main %>% 
-  filter(YEAR == 2017) %>% 
-  mutate(have_est = ifelse(ESTAB>0, 1, 0))
-
-est_emp = feols(lemp ~ lma_in + lma_out + coastal + border, data = resid_graph)
-est_est = feols(lest ~ lma_in + lma_out + coastal + border, data = resid_graph)
-
-resid_graph = resid_graph %>% 
-  mutate(resid_est = residuals(est_est),
-         resid_emp = residuals(est_emp))
-
-q_est <- quantile(resid_graph$resid_est, probs = c(.01, .99), na.rm = TRUE)
-q_emp = quantile(resid_graph$resid_emp, probs = c(.01, .99), na.rm = TRUE)
-
-resid_graph = resid_graph %>% 
-  mutate(resid_clip_est = pmin(pmax(resid_est, q_est[1]), q_est[2]),
-         resid_clip_emp = pmin(pmax(resid_emp, q_emp[1]), q_emp[2]),
-         top_est = ifelse(resid_clip_est > quantile(resid_clip_est, 0.9, na.rm = TRUE), 1, 0),
-         top_emp = ifelse(resid_clip_emp > quantile(resid_clip_emp, 0.9, na.rm = TRUE), 1, 0))
-
-map_resid = counties_sf %>% 
-  left_join(resid_graph, by = "GEO_ID")
-
-ggplot(map_resid) +
-  geom_sf(aes(fill = top_emp), color = NA) +
-  ggtitle("Top 10th EMP Resid County and Top 50 Big Cities, 2017")+
-  geom_sf(data = states_sf,
-          fill = NA,
-          color = "black",
-          size = 0.5)+
-  geom_sf(data = cities50, size = 0.5, color = "red") +
-  theme_void()
-ggsave("../output/emp_resid_17.png")
-
-rm(cities50, cities50_df)
-
-#kansus city 地跨两州，但是税率高的county反而有更多的est
-#考虑港口、国外市场
-
+    years <- 2015:2022
 
 
 # regression ----
+    ## market + foreign state counties ma x tax +foreign state counties ma x tax x post 
+    ## + home state counties ma x tax +home state counties ma x tax x post
+    ## kansus city 地跨两州，但是税率高的county反而有更多的est
 
-# market + foreign state counties gdp x tax +foreign state counties gdp x tax x post 
-# + home state counties gdp x tax +home state counties gdp x tax x post
-# 分离在本州和外州的gdp sum √
-# 收集tax数据，构建每个county x tax的数据
-# 扩大market radius
-# 写个模型 (见note) √
-reg = feols(
-  lemp ~ 
-  lma_in + lma_out + lgdp_tax_in + lgdp_tax_in * I(YEAR >= 2019) + lgdp_tax_out + lgdp_tax_out * I(YEAR >= 2019) |YEAR + GEO_ID ,
-  data = main,
-  cluster = ~STATEFP
-)
-
+    reg = feols(
+        lemp ~ 
+        lma_in + lma_out + lma_tax_in + lma_tax_in * I(YEAR >= 2019) + lma_tax_out + lma_tax_out * I(YEAR >= 2019) |YEAR + GEO_ID,
+        data = main,
+        cluster = ~STATEFP
+    )
+    summary(reg)
 
 
 # border density graph ----
-# hard to decide which county belongs to which border
+    ## hard to decide which county belongs to which border
 
-# clean tax data
-tax17 <- tax %>% 
-  select(tax_2017, GEO_ID)
-tax17$state_abbr <- state.abb[match(tax17$GEO_ID, state.name)]
+    state_tax_lookup <- main %>%
+        select(YEAR, state, state_abbr, sales_tax, cit) %>%
+        distinct()
 
-# combine density df
-density <- resid_graph %>% 
-  select(GEO_ID, NAME, YEAR, resid_clip_emp, state) %>% 
-  left_join(counties_sf %>% select(GEO_ID, dist_to_border, nearest_border), by = "GEO_ID") %>% 
-  drop_na() %>% # exclude alaska and hawaii
-  separate(nearest_border, into = c("state1", "state2"), sep = "-")
-density$state_home <- state.abb[match(density$state, state.name)]
-density <- density %>% 
-  mutate(state_other = ifelse(state1 == state_home, state2, state1)) %>% 
-  select(-state1, -state2) %>% 
-  left_join(tax17 %>% select(-GEO_ID), by = c("state_home" = "state_abbr")) %>% 
-  rename(tax_home = tax_2017) %>%
-  left_join(tax17 %>% select(-GEO_ID), by = c("state_other" = "state_abbr")) %>% 
-  rename(tax_other = tax_2017) %>% 
-  mutate(high_side = ifelse(tax_home > tax_other, 1, -1),
-         dist_to_border_adj = dist_to_border * high_side)
+    # Border separation approach
+        # assign counties to every border whose 600km buffer intersects the county polygon
+        border_buffer <- st_buffer(state_border, dist = set_units(600, km))
+        border_matches <- st_intersects(counties_sf, border_buffer)
 
-ggplot(density, aes(x = dist_to_border_adj, y = resid_clip_emp)) +
-  geom_point(alpha = 0.3) +
-  geom_smooth()
+        # keep every county-border pair within the 600km buffer
+        county_border_assignment <- tibble(
+            county_idx = rep(seq_len(nrow(counties_sf)), lengths(border_matches)),
+            border_idx = unlist(border_matches)
+        ) %>%
+            mutate(
+                GEO_ID = counties_sf$GEO_ID[county_idx],
+                border_name = state_border$border_name[border_idx],
+                dist_to_border = as.numeric(
+                    st_distance(
+                        counties_sf[county_idx, ],
+                        state_border[border_idx, ],
+                        by_element = TRUE
+                    )
+                )
+            ) %>%
+            distinct(GEO_ID, border_name, .keep_all = TRUE) %>%
+            select(GEO_ID, border_name, dist_to_border) %>%
+            separate(border_name, into = c("state1", "state2"), sep = "-", remove = FALSE)
+            
+        # generate a "border county-year-NAICS" df 
+        border_county_year_naics <- main %>%
+            select(GEO_ID, YEAR, NAICS, type, EMP, lemp, lma_in, lma_out, coastal, border, state, state_abbr, sales_tax, cit) %>%
+            distinct() %>%
+            left_join(county_border_assignment, by = "GEO_ID") %>%
+            filter(!is.na(border_name)) %>%
+            mutate(
+                state_home = state_abbr,
+                state_other = case_when(
+                    state1 == state_home ~ state2,
+                    state2 == state_home ~ state1,
+                    TRUE ~ NA_character_
+                )
+            ) %>%
+            left_join(
+                state_tax_lookup %>% select(state_abbr, YEAR, sales_tax) %>% distinct() %>% rename(tax_home = sales_tax),
+                by = c("state_home" = "state_abbr", "YEAR" = "YEAR")
+            ) %>%
+            left_join(
+                state_tax_lookup %>% select(state_abbr, YEAR, sales_tax) %>% distinct() %>% rename(tax_other = sales_tax),
+                by = c("state_other" = "state_abbr", "YEAR" = "YEAR")
+            ) %>%
+            mutate(
+                high_tax_side = case_when(
+                    is.na(state_other) ~ NA_integer_,
+                    tax_home > tax_other ~ 1L,
+                    TRUE ~ -1L
+                ),
+                dist_to_border_adj = dist_to_border * high_tax_side
+            )
 
+        # calculate residual
+        border_resid <- border_county_year_naics
 
+        for (year in years) {
+            for (biz_type in c("online", "local")) {
+                est_emp <- feols(
+                    lemp ~ lma_in + lma_out + coastal + border + cit,
+                    data = border_resid %>% filter(YEAR == year, type == biz_type)
+                )
 
+                est_emp_ppml <- glm(
+                    EMP ~ lma_in + lma_out + coastal + border + cit,
+                    family = poisson(link = "log"),
+                    data = border_resid %>% filter(YEAR == year, type == biz_type)
+                )
+                border_resid[[paste0("resid_emp_", substr(year, 3, 4), "_", biz_type)]] <- NA_real_
+                border_resid[[paste0("resid_emp_", substr(year, 3, 4), "_", biz_type)]][border_resid$YEAR == year & border_resid$type == biz_type] <- residuals(est_emp)
+                border_resid[[paste0("resid_emp_ppml_", substr(year, 3, 4), "_", biz_type)]] <- NA_real_
+                border_resid[[paste0("resid_emp_ppml_", substr(year, 3, 4), "_", biz_type)]][border_resid$YEAR == year & border_resid$type == biz_type] <- residuals(est_emp_ppml)
+            }
+        }
 
-# export did parallel trend graph ----
-png("../output/did_pop_iplot.png", width = 800, height = 600, res = 150)
-iplot(did_pop, main = "Effect on Establishment Number\nTreatment = 1 (border county) * 1 (pop < 10th_pop)")
-dev.off()
+        for (year in years) {
+            for (biz_type in c("online", "local")) {
+                suffix <- paste0(substr(year, 3, 4), "_", biz_type)
+                q_emp <- quantile(border_resid[[paste0("resid_emp_", suffix)]], probs = c(.01, .99), na.rm = TRUE)
+                border_resid[[paste0("resid_clip_emp_", suffix)]] <- pmin(
+                    pmax(border_resid[[paste0("resid_emp_", suffix)]], q_emp[1]),
+                    q_emp[2]
+                )
+            }
+        }
+        for (year in years) {
+            for (biz_type in c("online", "local")) {
+                suffix <- paste0(substr(year, 3, 4), "_", biz_type)
+                q_emp <- quantile(border_resid[[paste0("resid_emp_ppml_", suffix)]], probs = c(.01, .99), na.rm = TRUE)
+                border_resid[[paste0("resid_clip_emp_ppml_", suffix)]] <- pmin(
+                    pmax(border_resid[[paste0("resid_emp_ppml_", suffix)]], q_emp[1]),
+                    q_emp[2]
+                )
+            }
+        }
 
-png("../output/did_iplot.png", width = 800, height = 600, res = 150)
-iplot(did, main = "Effect on Establishment Number\nTreatment = 1 (border county)")
-dev.off()
+        # generate border density
+        for (year in years) {
+            for (biz_type in c("online", "local")) {
+                suffix <- paste0(substr(year, 3, 4), "_", biz_type)
+                density_year <- border_resid %>%
+                    filter(
+                        YEAR == year,
+                        type == biz_type,
+                        !is.na(high_tax_side),
+                        !is.na(!!sym(paste0("resid_clip_emp_", suffix)))
+                    )
+                if (biz_type == "online") {
+                ggplot(density_year, aes(x = dist_to_border_adj, y = !!sym(paste0("resid_clip_emp_", suffix)))) +
+                    geom_point(alpha = 0.3) +
+                    geom_smooth() +
+                    coord_cartesian(ylim = c(-10, -2))
+                }else {
+                ggplot(density_year, aes(x = dist_to_border_adj, y = !!sym(paste0("resid_clip_emp_", suffix)))) +
+                    geom_point(alpha = 0.3) +
+                    geom_smooth() +
+                    coord_cartesian(ylim = c(-20, -8))
+                }
 
-png("../output/did_pop_trend_iplot.png", width = 800, height = 600, res = 150)
-iplot(did_pop_trend, main = "Effect on the Trend of Establishment Number\nTreatment = 1 (border county) * 1 (pop < 10th_pop)")
-dev.off()
+                dir.create(paste0("output_ex_dist_inh/", biz_type), recursive = TRUE, showWarnings = FALSE)
+                ggsave(paste0("output_ex_dist_inh/", biz_type, "/border_density_", suffix, ".png"))
+            }
+        }
+    
+    # Closest border approach 
+        resid <- main
+        # Calculate residuals for each year
+        for (year in years) {
+            for (biz_type in c("online", "local")) {
+                est_emp <- feols(
+                    lemp ~ lma_in + lma_out + coastal + border + cit,
+                    data = resid %>% filter(YEAR == year, type == biz_type)
+                )
 
-etable(did_trend, file = "../output/did_trend.tex")
+                est_emp_ppml <- glm(
+                    EMP ~ lma_in + lma_out + coastal + border + cit,
+                    family = poisson(link = "log"),
+                    data = resid %>% filter(YEAR == year, type == biz_type)
+                )
+                summary(est_emp_ppml)
+                resid[[paste0("resid_emp_", substr(year, 3, 4), "_", biz_type)]] <- NA_real_
+                resid[[paste0("resid_emp_", substr(year, 3, 4), "_", biz_type)]][resid$YEAR == year & resid$type == biz_type] <- residuals(est_emp)
+                resid[[paste0("resid_emp_ppml_", substr(year, 3, 4), "_", biz_type)]] <- NA_real_
+                resid[[paste0("resid_emp_ppml_", substr(year, 3, 4), "_", biz_type)]][resid$YEAR == year & resid$type == biz_type] <- residuals(est_emp_ppml)
 
-# if using asinh, the coefficient is between 0.1 - 0.2. Most counties 
+            }
+        }
+
+        # Calculate quantiles and clip for each year
+        for (year in years) {
+            for (biz_type in c("online", "local")) {
+            suffix <- paste0(substr(year, 3, 4), "_", biz_type)
+            q_emp <- quantile(resid[[paste0("resid_emp_", suffix)]], probs = c(.01, .99), na.rm = TRUE)
+            resid[[paste0("resid_clip_emp_", suffix)]] <- pmin(pmax(resid[[paste0("resid_emp_", suffix)]], q_emp[1]), q_emp[2])
+            }
+        }
+        for (year in years) {
+            for (biz_type in c("online", "local")) {
+            suffix <- paste0(substr(year, 3, 4), "_", biz_type)
+            q_emp <- quantile(resid[[paste0("resid_emp_ppml_", suffix)]], probs = c(.01, .99), na.rm = TRUE)
+            resid[[paste0("resid_clip_emp_ppml_", suffix)]] <- pmin(pmax(resid[[paste0("resid_emp_ppml_", suffix)]], q_emp[1]), q_emp[2])
+            }
+        }
+
+        # combine density df
+        density <- resid %>% 
+            select(GEO_ID, YEAR, type, starts_with("resid_clip_emp_"), state, state_abbr, sales_tax, cit) %>% 
+            left_join(counties_sf %>% select(GEO_ID, dist_to_border, nearest_border), by = "GEO_ID") %>% 
+            separate(nearest_border, into = c("state1", "state2"), sep = "-")
+        density$state_home <- density$state_abbr
+
+        # Generate plots for each year
+        for (year in years) {
+            for (biz_type in c("online", "local")) {
+            suffix <- paste0(substr(year, 3, 4), "_", biz_type)
+            density_year <- density %>%
+                filter(type == biz_type, !is.na(!!sym(paste0("resid_clip_emp_", suffix)))) %>% 
+                mutate(state_other = ifelse(state1 == state_home, state2, state1)) %>% 
+                select(-state1, -state2) %>% 
+                left_join(
+                    state_tax_lookup %>% select(state_abbr, YEAR, sales_tax) %>% distinct() %>% rename(tax_other = sales_tax),
+                    by = c("state_other" = "state_abbr", "YEAR" = "YEAR")
+                ) %>% 
+                rename(tax_home = sales_tax) %>%
+                mutate(high_side = ifelse(tax_home > tax_other, 1, -1),
+                    dist_to_border_adj = dist_to_border * high_side)
+            
+            if (biz_type == "online") {
+                ggplot(density_year, aes(x = dist_to_border_adj, y = !!sym(paste0("resid_clip_emp_", suffix)))) +
+                    geom_point(alpha = 0.3) +
+                    geom_smooth() +
+                    coord_cartesian(ylim = c(-5, -5))
+            }else {
+                ggplot(density_year, aes(x = dist_to_border_adj, y = !!sym(paste0("resid_clip_emp_", suffix)))) +
+                    geom_point(alpha = 0.3) +
+                    geom_smooth() +
+                    coord_cartesian(ylim = c(-5, -5))
+            }
+            dir.create(paste0("output_ex_dist_inh/", biz_type), recursive = TRUE, showWarnings = FALSE)
+            ggsave(paste0("output_ex_dist_inh/", biz_type, "/density_", suffix, ".png"))
+            }
+        }
+

@@ -18,8 +18,6 @@ library(contdid)
 # import raw ----
 main = read.csv("../data/temp/state_con_tax.csv")
 
-
-
 # Staggered DiD ----
 did = feols(
   rcon ~ sunab(wayfair_year, year, ref.p = -1) | state + year,
@@ -28,7 +26,7 @@ did = feols(
 )
 iplot(did)
 
-
+getOption("error")
 
 # Staggered Continuous DiD ----
 cd_res <- cont_did(
