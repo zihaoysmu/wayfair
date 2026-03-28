@@ -1,29 +1,6 @@
 # library ----
-library(dplyr)
-library(stringr)
-library(readxl)
-library(tidyr)
-library(gt)
-library(psych)
-library(tibble)
-library(fixest)
-library(sf)
-library(tigris)
-library(ggplot2)
-library(stringr)
-library(aod)
-library(units)
-library(data.table)
-library(scales)
-library(rnaturalearth)
-library(rnaturalearthdata)
-library(maps)
-library(ggrepel)
-library(lintr)
-library(languageserver)
-library(tidycensus)
+source("code/setup.R")
 options(tigris_use_cache = TRUE)
-options(error = traceback)
 
 
 # import raw data ----
@@ -168,18 +145,22 @@ options(error = traceback)
 
 
 # combine main ----
-    #add back county's own gdp to gdp_in and ma_in
+    # add back county's own gdp to gdp_in and both market access measures
+    # only keep counties in the 48 contiguous states and DC, drop AK, HI, PR, and other territories
     main <- cbp %>% 
     left_join(cty %>% select(GEOID, state, is_boundary_county, STATEFP, coastal, border, `2018pop`), by = c("GEO_ID" = "GEOID")) %>% 
-    filter(STATEFP != 72) %>% 
+    filter(!STATEFP %in% exclude) %>% 
     left_join(gdp, by = c("YEAR" = "YEAR", "GEO_ID" = "GEO_ID")) %>% 
     left_join(market, by = c("YEAR" = "year", "GEO_ID" = "GEOID_i")) %>% 
     mutate(lest = asinh(ESTAB),
             gdp = as.numeric(gdp),
             ma_in = ma_in + gdp,
+            ma_in_new = ma_in_new + gdp,
             gdp_in = gdp + gdp_in,
             lma_in = log(ma_in),
-            lma_out = asinh(ma_out),
+            lma_out = log(ma_out),
+            lma_in_expo = log(ma_in_new),
+            lma_out_expo = log(ma_out_new),
             lemp = asinh(EMP),
             lgdp_tax_in = asinh(gdp_tax_in),
             lma_tax_in = asinh(ma_tax_in),
@@ -202,32 +183,130 @@ options(error = traceback)
 
     years <- 2015:2022
 
+    county_border_lookup <- counties_sf %>%
+        st_drop_geometry() %>%
+        select(GEO_ID, dist_to_border, nearest_border) %>%
+        separate(nearest_border, into = c("state1", "state2"), sep = "-", remove = FALSE)
+
+    state_tax_lookup <- main %>%
+        select(YEAR, state, state_abbr, sales_tax, cit) %>%
+        distinct()
+
+    # Distance to border is in meters
+    main <- main %>%
+        left_join(county_border_lookup, by = "GEO_ID") %>%
+        mutate(
+            state_home = state_abbr,
+            state_other = case_when(
+                state1 == state_home ~ state2,
+                state2 == state_home ~ state1,
+                TRUE ~ NA_character_
+            )
+        ) %>%
+        left_join(
+            state_tax_lookup %>%
+                select(state_abbr, YEAR, sales_tax) %>%
+                distinct() %>%
+                rename(tax_other = sales_tax),
+            by = c("state_other" = "state_abbr", "YEAR" = "YEAR")
+        ) %>%
+        mutate(
+            high_tax_side = case_when(
+                is.na(state_other) ~ NA_integer_,
+                sales_tax > tax_other ~ 1L,
+                TRUE ~ -1L
+            ),
+            dist_to_border_signed = dist_to_border * high_tax_side
+        )
+
 
 # regression ----
     ## market + foreign state counties ma x tax +foreign state counties ma x tax x post 
     ## + home state counties ma x tax +home state counties ma x tax x post
     ## kansus city 地跨两州，但是税率高的county反而有更多的est
 
-    reg = feols(
+    reg <- feols(
         lemp ~ 
         lma_in + lma_out + lma_tax_in + lma_tax_in * I(YEAR >= 2019) + lma_tax_out + lma_tax_out * I(YEAR >= 2019) |YEAR + GEO_ID,
         data = main,
         cluster = ~STATEFP
     )
-    summary(reg)
 
+    panel_groups <- list(
+        `2015-2018` = 2015:2018,
+        `2019-2022` = 2019:2022
+    )
+    
+
+    rdd_results <- lapply(names(panel_groups), function(group_name) {
+        group_years <- panel_groups[[group_name]]
+
+        year_dummies <- model.matrix(~ factor(YEAR) - 1, data = group_data)
+        state_dummies <- model.matrix(~ factor(STATEFP) - 1, data = group_data)
+
+        group_data <- main %>%
+            filter(YEAR %in% group_years) %>%
+            select(
+                GEO_ID, YEAR, STATEFP, lemp, dist_to_border_signed,
+                lma_in, lma_out, coastal, border, cit, EMP
+            ) %>%
+            drop_na()
+
+
+        fe_reg <- fepois(
+            EMP ~ lma_in + lma_out + cit | GEO_ID + YEAR,
+            data = group_data,
+            cluster = ~STATEFP
+        )
+
+        # Remove singletons in regression to align data and calculated residuals
+        group_data <- group_data %>%
+            slice(obs(fe_reg)) %>%
+            mutate(emp_resid = residuals(fe_reg))
+
+        reg_rdd <- rdrobust(
+            y = group_data$emp_resid,
+            x = group_data$dist_to_border_signed,
+            c = 0,
+            kernel = "triangular",
+            p = 1,
+            q = 2,
+            h = 50000,
+            bwselect = "mserd",
+            cluster = group_data$STATEFP
+        )
+
+        tibble(
+            panel_group = group_name,
+            N = nrow(group_data),
+            N_h_l = reg_rdd$N_h[1],
+            N_h_r = reg_rdd$N_h[2],
+            bw_l = reg_rdd$bws[1, 1],
+            bw_r = reg_rdd$bws[1, 2],
+            coef = reg_rdd$coef[3],
+            se = reg_rdd$se[3],
+            p = reg_rdd$pv[3],
+            ci_l = reg_rdd$ci[3, 1],
+            ci_r = reg_rdd$ci[3, 2]
+        )
+    })
+
+    rdd_summary <- bind_rows(rdd_results)
+    stargazer(
+        as.data.frame(rdd_summary),
+        type = "latex",
+        summary = FALSE,
+        rownames = FALSE,
+        out = "output/rdd_summary.tex"
+    )
 
 # border density graph ----
     ## hard to decide which county belongs to which border
 
-    state_tax_lookup <- main %>%
-        select(YEAR, state, state_abbr, sales_tax, cit) %>%
-        distinct()
-
-    # Border separation approach
-        # assign counties to every border whose 600km buffer intersects the county polygon
+    # Unique border approach
+        # assign counties to every border whose 600km buffer intersects the county centroid
         border_buffer <- st_buffer(state_border, dist = set_units(600, km))
-        border_matches <- st_intersects(counties_sf, border_buffer)
+        border_matches <- st_intersects(county_cent, border_buffer)
 
         # keep every county-border pair within the 600km buffer
         county_border_assignment <- tibble(
@@ -239,7 +318,7 @@ options(error = traceback)
                 border_name = state_border$border_name[border_idx],
                 dist_to_border = as.numeric(
                     st_distance(
-                        counties_sf[county_idx, ],
+                        county_cent[county_idx, ],
                         state_border[border_idx, ],
                         by_element = TRUE
                     )
@@ -248,10 +327,14 @@ options(error = traceback)
             distinct(GEO_ID, border_name, .keep_all = TRUE) %>%
             select(GEO_ID, border_name, dist_to_border) %>%
             separate(border_name, into = c("state1", "state2"), sep = "-", remove = FALSE)
-            
-        # generate a "border county-year-NAICS" df 
+
+        # generate a "border county-year-NAICS" df
         border_county_year_naics <- main %>%
-            select(GEO_ID, YEAR, NAICS, type, EMP, lemp, lma_in, lma_out, coastal, border, state, state_abbr, sales_tax, cit) %>%
+            select(
+                GEO_ID, YEAR, NAICS, type, EMP, lemp,
+                lma_in, lma_out, lma_in_expo, lma_out_expo,
+                coastal, border, state, state_abbr, sales_tax, cit
+            ) %>%
             distinct() %>%
             left_join(county_border_assignment, by = "GEO_ID") %>%
             filter(!is.na(border_name)) %>%
@@ -264,11 +347,17 @@ options(error = traceback)
                 )
             ) %>%
             left_join(
-                state_tax_lookup %>% select(state_abbr, YEAR, sales_tax) %>% distinct() %>% rename(tax_home = sales_tax),
+                state_tax_lookup %>%
+                    select(state_abbr, YEAR, sales_tax) %>%
+                    distinct() %>%
+                    rename(tax_home = sales_tax),
                 by = c("state_home" = "state_abbr", "YEAR" = "YEAR")
             ) %>%
             left_join(
-                state_tax_lookup %>% select(state_abbr, YEAR, sales_tax) %>% distinct() %>% rename(tax_other = sales_tax),
+                state_tax_lookup %>%
+                    select(state_abbr, YEAR, sales_tax) %>%
+                    distinct() %>%
+                    rename(tax_other = sales_tax),
                 by = c("state_other" = "state_abbr", "YEAR" = "YEAR")
             ) %>%
             mutate(
@@ -280,153 +369,161 @@ options(error = traceback)
                 dist_to_border_adj = dist_to_border * high_tax_side
             )
 
-        # calculate residual
-        border_resid <- border_county_year_naics
+    ma_specs <- list(
+        linear = list(in_var = "lma_in", out_var = "lma_out"),
+        expo = list(in_var = "lma_in_expo", out_var = "lma_out_expo")
+    )
 
-        for (year in years) {
-            for (biz_type in c("online", "local")) {
-                est_emp <- feols(
-                    lemp ~ lma_in + lma_out + coastal + border + cit,
-                    data = border_resid %>% filter(YEAR == year, type == biz_type)
-                )
+    regression_specs <- c("inh", "ppml", "raw_inh")
+    summary_years <- c(2017, 2019)
+    summary_plot_registry <- list()
 
-                est_emp_ppml <- glm(
-                    EMP ~ lma_in + lma_out + coastal + border + cit,
-                    family = poisson(link = "log"),
-                    data = border_resid %>% filter(YEAR == year, type == biz_type)
-                )
-                border_resid[[paste0("resid_emp_", substr(year, 3, 4), "_", biz_type)]] <- NA_real_
-                border_resid[[paste0("resid_emp_", substr(year, 3, 4), "_", biz_type)]][border_resid$YEAR == year & border_resid$type == biz_type] <- residuals(est_emp)
-                border_resid[[paste0("resid_emp_ppml_", substr(year, 3, 4), "_", biz_type)]] <- NA_real_
-                border_resid[[paste0("resid_emp_ppml_", substr(year, 3, 4), "_", biz_type)]][border_resid$YEAR == year & border_resid$type == biz_type] <- residuals(est_emp_ppml)
-            }
+    build_plot <- function(plot_data, x_var, biz_type, panel_title = NULL) {
+        plot_df <- plot_data %>%
+            mutate(
+                border_side = if_else(.data[[x_var]] < 0, "left", "right"),
+                distance_km = .data[[x_var]] / 1000
+            )
+
+        y_label <- if_else(
+            biz_type == "online",
+            "Residualized employment in online industry",
+            "Residualized employment in local industry"
+        )
+
+        plot_obj <- ggplot(plot_df, aes(x = distance_km, y = plot_resid)) +
+            geom_hline(yintercept = 0, linewidth = 0.4, color = "grey50") +
+            geom_smooth(
+                aes(group = border_side, fill = border_side),
+                method = "loess",
+                se = TRUE,
+                show.legend = FALSE
+            ) +
+            labs(
+                x = "Distance to state border (km; positive = high-tax side)",
+                y = y_label
+            )
+
+        if (!is.null(panel_title)) {
+            plot_obj <- plot_obj + ggtitle(panel_title)
         }
 
-        for (year in years) {
-            for (biz_type in c("online", "local")) {
-                suffix <- paste0(substr(year, 3, 4), "_", biz_type)
-                q_emp <- quantile(border_resid[[paste0("resid_emp_", suffix)]], probs = c(.01, .99), na.rm = TRUE)
-                border_resid[[paste0("resid_clip_emp_", suffix)]] <- pmin(
-                    pmax(border_resid[[paste0("resid_emp_", suffix)]], q_emp[1]),
-                    q_emp[2]
-                )
-            }
-        }
-        for (year in years) {
-            for (biz_type in c("online", "local")) {
-                suffix <- paste0(substr(year, 3, 4), "_", biz_type)
-                q_emp <- quantile(border_resid[[paste0("resid_emp_ppml_", suffix)]], probs = c(.01, .99), na.rm = TRUE)
-                border_resid[[paste0("resid_clip_emp_ppml_", suffix)]] <- pmin(
-                    pmax(border_resid[[paste0("resid_emp_ppml_", suffix)]], q_emp[1]),
-                    q_emp[2]
-                )
-            }
-        }
+        plot_obj
+    }
 
-        # generate border density
-        for (year in years) {
-            for (biz_type in c("online", "local")) {
-                suffix <- paste0(substr(year, 3, 4), "_", biz_type)
-                density_year <- border_resid %>%
-                    filter(
-                        YEAR == year,
-                        type == biz_type,
-                        !is.na(high_tax_side),
-                        !is.na(!!sym(paste0("resid_clip_emp_", suffix)))
-                    )
-                if (biz_type == "online") {
-                ggplot(density_year, aes(x = dist_to_border_adj, y = !!sym(paste0("resid_clip_emp_", suffix)))) +
-                    geom_point(alpha = 0.3) +
-                    geom_smooth() +
-                    coord_cartesian(ylim = c(-10, -2))
-                }else {
-                ggplot(density_year, aes(x = dist_to_border_adj, y = !!sym(paste0("resid_clip_emp_", suffix)))) +
-                    geom_point(alpha = 0.3) +
-                    geom_smooth() +
-                    coord_cartesian(ylim = c(-20, -8))
+    generate_density_plots <- function(plot_df, approach_name, x_var) {
+        for (ma_type in names(ma_specs)) {
+            in_var <- ma_specs[[ma_type]]$in_var
+            out_var <- ma_specs[[ma_type]]$out_var
+
+            for (reg_type in regression_specs) {
+                for (year in years) {
+                    for (biz_type in c("online", "local")) {
+                        model_data <- plot_df %>%
+                            filter(
+                                YEAR == year,
+                                type == biz_type,
+                                !is.na(high_tax_side)
+                            ) %>%
+                            select(
+                                GEO_ID, YEAR, type, EMP, lemp, coastal, border, cit,
+                                all_of(c(in_var, out_var, x_var))
+                            ) %>%
+                            drop_na()
+
+                        if (nrow(model_data) == 0) {
+                            next
+                        }
+
+                        if (reg_type == "raw_inh") {
+                            plot_data <- model_data %>%
+                                mutate(plot_resid = lemp)
+                        } else {
+                            regression_formula <- as.formula(
+                                paste(
+                                    ifelse(reg_type == "inh", "lemp", "EMP"),
+                                    "~",
+                                    paste(c(in_var, out_var, "coastal", "border", "cit"), collapse = " + ")
+                                )
+                            )
+
+                            model <- if (reg_type == "inh") {
+                                feols(regression_formula, data = model_data)
+                            } else {
+                                glm(
+                                    regression_formula,
+                                    family = poisson(link = "log"),
+                                    data = model_data
+                                )
+                            }
+
+                            plot_data <- model_data %>%
+                                mutate(plot_resid = residuals(model))
+                        }
+
+                        q_resid <- quantile(plot_data$plot_resid, probs = c(.01, .99), na.rm = TRUE)
+                        plot_data <- plot_data %>%
+                            mutate(plot_resid = pmin(pmax(plot_resid, q_resid[1]), q_resid[2]))
+
+                        output_dir <- file.path("output", approach_name, ma_type, reg_type, biz_type)
+                        dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+                        panel_title <- paste(
+                            ifelse(ma_type == "linear", "Linear access", "Exponential access"),
+                            ifelse(approach_name == "unique_border", "Unique border", "Unique county"),
+                            sep = " + "
+                        )
+
+                        plot_obj <- build_plot(
+                            plot_data = plot_data,
+                            x_var = x_var,
+                            biz_type = biz_type,
+                            panel_title = panel_title
+                        )
+
+                        ggsave(file.path(output_dir, paste0(year, ".png")), plot = plot_obj)
+
+                        if (reg_type == "ppml" && biz_type == "online" && year %in% summary_years) {
+                            summary_key <- paste(year, ma_type, approach_name, sep = "__")
+                            summary_plot_registry[[summary_key]] <<- plot_obj
+                        }
+                    }
                 }
-
-                dir.create(paste0("output_ex_dist_inh/", biz_type), recursive = TRUE, showWarnings = FALSE)
-                ggsave(paste0("output_ex_dist_inh/", biz_type, "/border_density_", suffix, ".png"))
             }
         }
-    
-    # Closest border approach 
-        resid <- main
-        # Calculate residuals for each year
-        for (year in years) {
-            for (biz_type in c("online", "local")) {
-                est_emp <- feols(
-                    lemp ~ lma_in + lma_out + coastal + border + cit,
-                    data = resid %>% filter(YEAR == year, type == biz_type)
-                )
+    }
 
-                est_emp_ppml <- glm(
-                    EMP ~ lma_in + lma_out + coastal + border + cit,
-                    family = poisson(link = "log"),
-                    data = resid %>% filter(YEAR == year, type == biz_type)
-                )
-                summary(est_emp_ppml)
-                resid[[paste0("resid_emp_", substr(year, 3, 4), "_", biz_type)]] <- NA_real_
-                resid[[paste0("resid_emp_", substr(year, 3, 4), "_", biz_type)]][resid$YEAR == year & resid$type == biz_type] <- residuals(est_emp)
-                resid[[paste0("resid_emp_ppml_", substr(year, 3, 4), "_", biz_type)]] <- NA_real_
-                resid[[paste0("resid_emp_ppml_", substr(year, 3, 4), "_", biz_type)]][resid$YEAR == year & resid$type == biz_type] <- residuals(est_emp_ppml)
+    generate_density_plots(
+        plot_df = border_county_year_naics,
+        approach_name = "unique_border",
+        x_var = "dist_to_border_adj"
+    )
 
-            }
-        }
+    # Unique county approach
+    generate_density_plots(
+        plot_df = main,
+        approach_name = "unique_county",
+        x_var = "dist_to_border_signed"
+    )
 
-        # Calculate quantiles and clip for each year
-        for (year in years) {
-            for (biz_type in c("online", "local")) {
-            suffix <- paste0(substr(year, 3, 4), "_", biz_type)
-            q_emp <- quantile(resid[[paste0("resid_emp_", suffix)]], probs = c(.01, .99), na.rm = TRUE)
-            resid[[paste0("resid_clip_emp_", suffix)]] <- pmin(pmax(resid[[paste0("resid_emp_", suffix)]], q_emp[1]), q_emp[2])
-            }
-        }
-        for (year in years) {
-            for (biz_type in c("online", "local")) {
-            suffix <- paste0(substr(year, 3, 4), "_", biz_type)
-            q_emp <- quantile(resid[[paste0("resid_emp_ppml_", suffix)]], probs = c(.01, .99), na.rm = TRUE)
-            resid[[paste0("resid_clip_emp_ppml_", suffix)]] <- pmin(pmax(resid[[paste0("resid_emp_ppml_", suffix)]], q_emp[1]), q_emp[2])
-            }
-        }
+    summary_output_dir <- file.path("output", "summary", "ppml", "online")
+    dir.create(summary_output_dir, recursive = TRUE, showWarnings = FALSE)
 
-        # combine density df
-        density <- resid %>% 
-            select(GEO_ID, YEAR, type, starts_with("resid_clip_emp_"), state, state_abbr, sales_tax, cit) %>% 
-            left_join(counties_sf %>% select(GEO_ID, dist_to_border, nearest_border), by = "GEO_ID") %>% 
-            separate(nearest_border, into = c("state1", "state2"), sep = "-")
-        density$state_home <- density$state_abbr
+    for (year in summary_years) {
+        summary_plot <- (
+            summary_plot_registry[[paste(year, "linear", "unique_border", sep = "__")]] +
+            summary_plot_registry[[paste(year, "linear", "unique_county", sep = "__")]]
+        ) / (
+            summary_plot_registry[[paste(year, "expo", "unique_border", sep = "__")]] +
+            summary_plot_registry[[paste(year, "expo", "unique_county", sep = "__")]]
+        ) +
+            plot_annotation(title = paste("PPML residualized employment in online industry,", year))
 
-        # Generate plots for each year
-        for (year in years) {
-            for (biz_type in c("online", "local")) {
-            suffix <- paste0(substr(year, 3, 4), "_", biz_type)
-            density_year <- density %>%
-                filter(type == biz_type, !is.na(!!sym(paste0("resid_clip_emp_", suffix)))) %>% 
-                mutate(state_other = ifelse(state1 == state_home, state2, state1)) %>% 
-                select(-state1, -state2) %>% 
-                left_join(
-                    state_tax_lookup %>% select(state_abbr, YEAR, sales_tax) %>% distinct() %>% rename(tax_other = sales_tax),
-                    by = c("state_other" = "state_abbr", "YEAR" = "YEAR")
-                ) %>% 
-                rename(tax_home = sales_tax) %>%
-                mutate(high_side = ifelse(tax_home > tax_other, 1, -1),
-                    dist_to_border_adj = dist_to_border * high_side)
-            
-            if (biz_type == "online") {
-                ggplot(density_year, aes(x = dist_to_border_adj, y = !!sym(paste0("resid_clip_emp_", suffix)))) +
-                    geom_point(alpha = 0.3) +
-                    geom_smooth() +
-                    coord_cartesian(ylim = c(-5, -5))
-            }else {
-                ggplot(density_year, aes(x = dist_to_border_adj, y = !!sym(paste0("resid_clip_emp_", suffix)))) +
-                    geom_point(alpha = 0.3) +
-                    geom_smooth() +
-                    coord_cartesian(ylim = c(-5, -5))
-            }
-            dir.create(paste0("output_ex_dist_inh/", biz_type), recursive = TRUE, showWarnings = FALSE)
-            ggsave(paste0("output_ex_dist_inh/", biz_type, "/density_", suffix, ".png"))
-            }
-        }
+        ggsave(
+            filename = file.path(summary_output_dir, paste0(year, ".png")),
+            plot = summary_plot,
+            width = 14,
+            height = 10
+        )
+    }
 
