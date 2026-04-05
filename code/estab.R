@@ -2,13 +2,12 @@
 source("code/setup.R")
 options(tigris_use_cache = TRUE)
 
-
 # import raw data ----
     gdp <- read.csv("data/temp/gdp_temp.csv", colClasses = c(GEO_ID = "character"))
     cbp <- read.csv("data/temp/cbp_temp.csv", colClasses = c(GEO_ID = "character")) 
     market <- read.csv("data/temp/market_temp.csv", colClasses = c(GEOID_i = "character")) 
-    state <- read.csv("data/temp/state_con_tax.csv") 
-    raw_pop <- read_xlsx("C:/document/SMU PhD/research/Data/Census Population Estimates Program/co-est2020int-pop.xlsx") 
+    raw_state <- read.csv("data/temp/state_con_tax.csv")
+    raw_pop <- read_xlsx("C:/document/SMU PhD/research/Data/Census Population Estimates Program/2010-2025 county pop.xlsx") 
     tax_raw <- read_xlsx("data/raw/combined sales tax.xlsx") 
     cit_raw <- read_xlsx("data/raw/us_state_corporate_tax.xlsx")
     data("fips_codes")
@@ -28,7 +27,7 @@ options(tigris_use_cache = TRUE)
         ) %>%
         mutate(YEAR = as.integer(str_remove(tax_year, "^tax_"))) %>%
         filter(!is.na(state_code)) %>%
-        select(state, state_code, YEAR, sales_tax)
+        select("state", state_code, YEAR, sales_tax)
 
     cit <- cit_raw %>%
         rename(state = state_name, state_abbr = abbrev) %>%
@@ -39,7 +38,7 @@ options(tigris_use_cache = TRUE)
         ) %>%
         mutate(YEAR = as.integer(str_remove(cit_year, "^corporate_tax_"))) %>%
         filter(!is.na(state_abbr)) %>%
-        select(state, state_abbr, YEAR, cit)
+        select("state", state_abbr, YEAR, cit)
 # clean population data ----
 
     pop <- raw_pop
@@ -47,8 +46,13 @@ options(tigris_use_cache = TRUE)
     pop <- pop %>% 
         separate(NAME, c("county", "state"), sep = ", ") %>% 
         left_join(fips_codes %>% select(state_code, state_name, county_code, county), by = c("state" = "state_name", "county" = "county")) %>%
-        mutate(GEO_ID = paste0(state_code, county_code)) %>% 
+        mutate(GEO_ID = paste0(state_code, county_code)) %>%
         drop_na()
+
+    pop_long <- pop %>%
+        pivot_longer(cols = matches("^[0-9]{4}pop$"), names_to = "year_str", values_to = "pop") %>%
+        mutate(YEAR = as.integer(str_remove(year_str, "pop"))) %>%
+        select(GEO_ID, YEAR, pop)
 
 # generate cty df ----
     # 1)读county边界
@@ -88,13 +92,13 @@ options(tigris_use_cache = TRUE)
     cty$coastal <- as.integer(
         lengths(st_intersects(cty, coastline)) > 0
     )
-    # 7)international indicator 
+    # 7)international indicator
     cty$border <- as.integer(
         lengths(st_intersects(cty, border_line)) > 0
     )
-
-    cty = cty %>% 
-        left_join(pop %>% select(GEO_ID, `2018pop`, state), by = c("GEOID" = "GEO_ID"))
+    # 8)add state name from pop
+    cty <- cty %>%
+        left_join(pop %>% select(GEO_ID, state), by = c("GEOID" = "GEO_ID"))
 
 # Establishment graph preparation ----
     # Generate counties and states
@@ -138,7 +142,7 @@ options(tigris_use_cache = TRUE)
         pairwise = TRUE
     )
 
-    counties_sf$dist_to_border <- as.numeric(st_length(nearest_pts))
+    counties_sf$dist_to_border <- as.numeric(st_length(nearest_pts)) / 1000
     counties_sf$nearest_border <- state_border$border_name[nearest_id]
 
     rm(coastline, countries, border_line, nb, neighbors, usa, states_pre)
@@ -148,7 +152,8 @@ options(tigris_use_cache = TRUE)
     # add back county's own gdp to gdp_in and both market access measures
     # only keep counties in the 48 contiguous states and DC, drop AK, HI, PR, and other territories
     main <- cbp %>% 
-    left_join(cty %>% select(GEOID, state, is_boundary_county, STATEFP, coastal, border, `2018pop`), by = c("GEO_ID" = "GEOID")) %>% 
+    left_join(cty %>% select(GEOID, "state", is_boundary_county, STATEFP, coastal, border), by = c("GEO_ID" = "GEOID")) %>%
+    left_join(pop_long, by = c("GEO_ID", "YEAR")) %>%
     filter(!STATEFP %in% exclude) %>% 
     left_join(gdp, by = c("YEAR" = "YEAR", "GEO_ID" = "GEO_ID")) %>% 
     left_join(market, by = c("YEAR" = "year", "GEO_ID" = "GEOID_i")) %>% 
@@ -166,7 +171,7 @@ options(tigris_use_cache = TRUE)
             lma_tax_in = asinh(ma_tax_in),
             lma_tax_out = asinh(ma_tax_out),
             lgdp_tax_out = asinh(gdp_tax_out)) %>% 
-    left_join(state %>% select(state, year, expo), by = c("state" = "state", "YEAR" = "year")) %>% 
+    left_join(raw_state %>% select(state, year, expo), by = c("state" = "state", "YEAR" = "year")) %>%
     left_join(tax %>% select(state, YEAR, sales_tax), by = c("state", "YEAR")) %>%
     left_join(cit %>% select(state, YEAR, cit, state_abbr), by = c("state", "YEAR")) %>%
     mutate(
@@ -211,6 +216,9 @@ options(tigris_use_cache = TRUE)
             by = c("state_other" = "state_abbr", "YEAR" = "YEAR")
         ) %>%
         mutate(
+            tax_diff = sales_tax - tax_other,
+            tax_diff_abs = abs(tax_diff),
+            tax_diff_abs_c = tax_diff_abs - mean(tax_diff_abs, na.rm = TRUE),
             high_tax_side = case_when(
                 is.na(state_other) ~ NA_integer_,
                 sales_tax > tax_other ~ 1L,
@@ -221,309 +229,216 @@ options(tigris_use_cache = TRUE)
 
 
 # regression ----
-    ## market + foreign state counties ma x tax +foreign state counties ma x tax x post 
-    ## + home state counties ma x tax +home state counties ma x tax x post
-    ## kansus city 地跨两州，但是税率高的county反而有更多的est
-
+    # FE OLS
     reg <- feols(
         lemp ~ 
-        lma_in + lma_out + lma_tax_in + lma_tax_in * I(YEAR >= 2019) + lma_tax_out + lma_tax_out * I(YEAR >= 2019) |YEAR + GEO_ID,
+        lma_in + lma_out + lma_tax_in + lma_tax_in * I(YEAR >= 2019) + lma_tax_out + lma_tax_out * I(YEAR >= 2019) + cit + pop |YEAR + GEO_ID,
         data = main,
         cluster = ~STATEFP
     )
 
-    panel_groups <- list(
-        `2015-2018` = 2015:2018,
-        `2019-2022` = 2019:2022
-    )
-    
+    # RDD 
+        # my approach
+        panel_groups <- list(
+            `2015-2018` = 2015:2018,
+            `2019-2022` = 2019:2022
+        )
+        
+        # all cluster except county in rdd cause errors (for unknown reasons), so just use county cluster and HC1 for now
+        # ideally, we want to cluster on border pair
+        bandwidths <- c(20, 50)
 
-    rdd_results <- lapply(names(panel_groups), function(group_name) {
-        group_years <- panel_groups[[group_name]]
+        rdd_results <- lapply(names(panel_groups), function(group_name) {
+            group_years <- panel_groups[[group_name]]
 
-        year_dummies <- model.matrix(~ factor(YEAR) - 1, data = group_data)
-        state_dummies <- model.matrix(~ factor(STATEFP) - 1, data = group_data)
+            group_data <- main %>%
+                filter(YEAR %in% group_years, type == "online") %>%
+                select(GEO_ID, YEAR, STATEFP, lemp, dist_to_border_signed,
+                    lma_in, lma_out, cit, EMP, nearest_border, pop) %>%
+                drop_na()
 
-        group_data <- main %>%
-            filter(YEAR %in% group_years) %>%
-            select(
-                GEO_ID, YEAR, STATEFP, lemp, dist_to_border_signed,
-                lma_in, lma_out, coastal, border, cit, EMP
-            ) %>%
+            # make sure both sides of the border are represented within the bandwidth
+            in_bw <- group_data %>% filter(abs(dist_to_border_signed) <= 50)
+            valid_pairs <- in_bw %>%
+                mutate(side = ifelse(dist_to_border_signed > 0, "right", "left")) %>%
+                group_by(nearest_border) %>%
+                summarise(n_sides = n_distinct(side)) %>%
+                filter(n_sides == 2) %>%
+                pull(nearest_border)
+
+            group_data <- group_data %>% filter(nearest_border %in% valid_pairs)
+
+            year_dummies <- model.matrix(~ factor(YEAR), data = group_data)[, -1, drop = FALSE]
+            pair_dummies <- model.matrix(~ factor(nearest_border), data = group_data)[, -1, drop = FALSE]
+
+            covs_mat <- cbind(group_data$lma_in, group_data$lma_out,
+                            group_data$cit, year_dummies, pair_dummies, group_data$pop)
+            # drop linearly dependent covariates using QR decomposition, for now no one is dropped
+            covs_mat <- covs_mat[, qr(covs_mat)$pivot[1:qr(covs_mat)$rank]]
+
+            lapply(bandwidths, function(bw) {
+                reg_rdd <- rdrobust(
+                    y = group_data$lemp,
+                    x = group_data$dist_to_border_signed,
+                    covs = covs_mat,
+                    cluster = group_data$GEO_ID,
+                    vce = "hc1",
+                    masspoints = "adjust",
+                    h = bw
+                )
+
+                tibble(
+                    panel_group = group_name,
+                    bandwidth = bw,
+                    N = nrow(group_data),
+                    N_h_l = reg_rdd$N_h[1],
+                    N_h_r = reg_rdd$N_h[2],
+                    bw_l = reg_rdd$bws[1, 1],
+                    bw_r = reg_rdd$bws[1, 2],
+                    coef = reg_rdd$coef[3],
+                    se = reg_rdd$se[3],
+                    p = reg_rdd$pv[3],
+                    ci_l = reg_rdd$ci[3, 1],
+                    ci_r = reg_rdd$ci[3, 2]
+                )
+            })
+        })
+
+        rdd_summary <- bind_rows(unlist(rdd_results, recursive = FALSE))
+        rdd_summary <- as.data.frame(rdd_summary) %>% 
+            arrange(bandwidth, panel_group)
+        stargazer(
+            rdd_summary,
+            type = "latex",
+            summary = FALSE,
+            rownames = FALSE,
+            out = "output/rdd_summary.tex"
+        )
+
+        # Grembi et al. 2016 approach
+        grembi <- main %>%
+            filter(type == "online") %>%
+            mutate(S = ifelse(dist_to_border_signed > 0, 1, 0),
+                   Tt = ifelse(YEAR <= 2018, 1, 0))
+        grembi_50000 <- grembi %>% filter(abs(dist_to_border_signed) <= 50)
+        grembi_20000 <- grembi %>% filter(abs(dist_to_border_signed) <= 20)
+
+            # heterogeneous effect by tax difference
+            grembi_rdd <- feols(
+            lemp ~ dist_to_border_signed + S + S:dist_to_border_signed +
+                Tt + Tt:dist_to_border_signed +
+                S:Tt + S:Tt:dist_to_border_signed +
+                S:tax_diff_abs_c + Tt:tax_diff_abs_c + S:Tt:tax_diff_abs_c +
+                lma_in_expo + lma_out_expo + cit + pop |
+                YEAR + nearest_border,
+            data = grembi_50000,
+            cluster = ~GEO_ID
+            )
+            # S:Tt is beta_0, the parameter of interest
+            summary(grembi_rdd)
+            etable(grembi_rdd,
+                tex = TRUE,
+                style.tex = style.tex(
+                    main = "aer",
+                    notes.tpt.intro = ""        
+                ),
+                drop = "YEAR|nearest_border",   
+                se.below = FALSE,               
+                fitstat = c("n", "r2"),    
+                digits = 3,      
+                file = "output/grembi_rdd.tex"
+            )
+
+
+        # Butts 2023 approach
+        # first difference
+        butt <- main %>%
+            filter(type == "online") %>%
+            filter(YEAR %in% c(2017, 2019)) %>%
+            group_by(GEO_ID) %>%
+            arrange(YEAR) %>%
+            mutate(d_lemp = lemp - lag(lemp),
+                   d_dist = dist_to_border_signed - lag(dist_to_border_signed),
+                   d_lma_in = lma_in - lag(lma_in),
+                   d_lma_out = lma_out - lag(lma_out),
+                   d_cit = cit - lag(cit),
+                   d_tax_diff_abs_c = tax_diff_abs_c - lag(tax_diff_abs_c),
+                   d_pop = pop - lag(pop)) %>%
+            ungroup() %>%
             drop_na()
 
-
-        fe_reg <- fepois(
-            EMP ~ lma_in + lma_out + cit | GEO_ID + YEAR,
-            data = group_data,
-            cluster = ~STATEFP
+        butt_rdd <- rdrobust(
+            y = butt$d_lemp,
+            x = butt$dist_to_border_signed,
+            covs = cbind(butt$d_lma_in, butt$d_lma_out, butt$d_cit, butt$d_pop, butt$d_tax_diff_abs_c),
+            cluster = butt$GEO_ID,
+            vce = "hc1",
+            masspoints = "adjust",
+            h = 50
+        )
+        summary(butt_rdd)
+        butt_summary <- as.data.frame(tibble(
+            bandwidth = 50,
+            N = nrow(butt),
+            N_h_l = butt_rdd$N_h[1],
+            N_h_r = butt_rdd$N_h[2],
+            bw_l = butt_rdd$bws[1, 1],
+            bw_r = butt_rdd$bws[1, 2],
+            coef = butt_rdd$coef[3],
+            se = butt_rdd$se[3],
+            p = butt_rdd$pv[3],
+            ci_l = butt_rdd$ci[3, 1],
+            ci_r = butt_rdd$ci[3, 2]
+        ))
+        stargazer(
+            butt_summary,
+            type = "latex",
+            summary = FALSE,
+            rownames = FALSE,
+            out = "output/butt_rdd.tex"
         )
 
-        # Remove singletons in regression to align data and calculated residuals
-        group_data <- group_data %>%
-            slice(obs(fe_reg)) %>%
-            mutate(emp_resid = residuals(fe_reg))
-
-        reg_rdd <- rdrobust(
-            y = group_data$emp_resid,
-            x = group_data$dist_to_border_signed,
-            c = 0,
-            kernel = "triangular",
-            p = 1,
-            q = 2,
-            h = 50000,
-            bwselect = "mserd",
-            cluster = group_data$STATEFP
+        # --- expo MA spec (test) ---
+        # Grembi et al. 2016 approach with exponential market access
+        grembi_expo_rdd <- feols(lemp ~ dist_to_border_signed + S + S:dist_to_border_signed + Tt + Tt:dist_to_border_signed + S:Tt + S:Tt:dist_to_border_signed
+        + lma_in_expo + lma_out_expo + cit + pop | YEAR + nearest_border,
+                data = grembi_50000,
+                cluster = ~GEO_ID)
+        summary(grembi_expo_rdd)
+        etable(grembi_expo_rdd,
+            tex = TRUE,
+            style.tex = style.tex(
+                main = "aer",
+                notes.tpt.intro = ""
+            ),
+            drop = "YEAR|nearest_border",
+            se.below = FALSE,
+            fitstat = c("n", "r2"),
+            digits = 3,
+            file = "output/grembi_expo_rdd.tex"
         )
 
-        tibble(
-            panel_group = group_name,
-            N = nrow(group_data),
-            N_h_l = reg_rdd$N_h[1],
-            N_h_r = reg_rdd$N_h[2],
-            bw_l = reg_rdd$bws[1, 1],
-            bw_r = reg_rdd$bws[1, 2],
-            coef = reg_rdd$coef[3],
-            se = reg_rdd$se[3],
-            p = reg_rdd$pv[3],
-            ci_l = reg_rdd$ci[3, 1],
-            ci_r = reg_rdd$ci[3, 2]
+        # Butts 2023 approach with exponential market access
+        butt_expo <- main %>%
+            filter(type == "online") %>%
+            filter(YEAR %in% c(2017, 2019)) %>%
+            group_by(GEO_ID) %>%
+            arrange(YEAR) %>%
+            mutate(d_lemp = lemp - lag(lemp),
+                   d_lma_in_expo = lma_in_expo - lag(lma_in_expo),
+                   d_lma_out_expo = lma_out_expo - lag(lma_out_expo),
+                   d_cit = cit - lag(cit),
+                   d_pop = pop - lag(pop)) %>%
+            ungroup() %>%
+            drop_na()
+
+        butt_expo_rdd <- rdrobust(
+            y = butt_expo$d_lemp,
+            x = butt_expo$dist_to_border_signed,
+            covs = cbind(butt_expo$d_lma_in_expo, butt_expo$d_lma_out_expo, butt_expo$d_cit, butt_expo$d_pop),
+            cluster = butt_expo$GEO_ID,
+            vce = "hc1",
+            masspoints = "adjust",
+            h = 50
         )
-    })
-
-    rdd_summary <- bind_rows(rdd_results)
-    stargazer(
-        as.data.frame(rdd_summary),
-        type = "latex",
-        summary = FALSE,
-        rownames = FALSE,
-        out = "output/rdd_summary.tex"
-    )
-
-# border density graph ----
-    ## hard to decide which county belongs to which border
-
-    # Unique border approach
-        # assign counties to every border whose 600km buffer intersects the county centroid
-        border_buffer <- st_buffer(state_border, dist = set_units(600, km))
-        border_matches <- st_intersects(county_cent, border_buffer)
-
-        # keep every county-border pair within the 600km buffer
-        county_border_assignment <- tibble(
-            county_idx = rep(seq_len(nrow(counties_sf)), lengths(border_matches)),
-            border_idx = unlist(border_matches)
-        ) %>%
-            mutate(
-                GEO_ID = counties_sf$GEO_ID[county_idx],
-                border_name = state_border$border_name[border_idx],
-                dist_to_border = as.numeric(
-                    st_distance(
-                        county_cent[county_idx, ],
-                        state_border[border_idx, ],
-                        by_element = TRUE
-                    )
-                )
-            ) %>%
-            distinct(GEO_ID, border_name, .keep_all = TRUE) %>%
-            select(GEO_ID, border_name, dist_to_border) %>%
-            separate(border_name, into = c("state1", "state2"), sep = "-", remove = FALSE)
-
-        # generate a "border county-year-NAICS" df
-        border_county_year_naics <- main %>%
-            select(
-                GEO_ID, YEAR, NAICS, type, EMP, lemp,
-                lma_in, lma_out, lma_in_expo, lma_out_expo,
-                coastal, border, state, state_abbr, sales_tax, cit
-            ) %>%
-            distinct() %>%
-            left_join(county_border_assignment, by = "GEO_ID") %>%
-            filter(!is.na(border_name)) %>%
-            mutate(
-                state_home = state_abbr,
-                state_other = case_when(
-                    state1 == state_home ~ state2,
-                    state2 == state_home ~ state1,
-                    TRUE ~ NA_character_
-                )
-            ) %>%
-            left_join(
-                state_tax_lookup %>%
-                    select(state_abbr, YEAR, sales_tax) %>%
-                    distinct() %>%
-                    rename(tax_home = sales_tax),
-                by = c("state_home" = "state_abbr", "YEAR" = "YEAR")
-            ) %>%
-            left_join(
-                state_tax_lookup %>%
-                    select(state_abbr, YEAR, sales_tax) %>%
-                    distinct() %>%
-                    rename(tax_other = sales_tax),
-                by = c("state_other" = "state_abbr", "YEAR" = "YEAR")
-            ) %>%
-            mutate(
-                high_tax_side = case_when(
-                    is.na(state_other) ~ NA_integer_,
-                    tax_home > tax_other ~ 1L,
-                    TRUE ~ -1L
-                ),
-                dist_to_border_adj = dist_to_border * high_tax_side
-            )
-
-    ma_specs <- list(
-        linear = list(in_var = "lma_in", out_var = "lma_out"),
-        expo = list(in_var = "lma_in_expo", out_var = "lma_out_expo")
-    )
-
-    regression_specs <- c("inh", "ppml", "raw_inh")
-    summary_years <- c(2017, 2019)
-    summary_plot_registry <- list()
-
-    build_plot <- function(plot_data, x_var, biz_type, panel_title = NULL) {
-        plot_df <- plot_data %>%
-            mutate(
-                border_side = if_else(.data[[x_var]] < 0, "left", "right"),
-                distance_km = .data[[x_var]] / 1000
-            )
-
-        y_label <- if_else(
-            biz_type == "online",
-            "Residualized employment in online industry",
-            "Residualized employment in local industry"
-        )
-
-        plot_obj <- ggplot(plot_df, aes(x = distance_km, y = plot_resid)) +
-            geom_hline(yintercept = 0, linewidth = 0.4, color = "grey50") +
-            geom_smooth(
-                aes(group = border_side, fill = border_side),
-                method = "loess",
-                se = TRUE,
-                show.legend = FALSE
-            ) +
-            labs(
-                x = "Distance to state border (km; positive = high-tax side)",
-                y = y_label
-            )
-
-        if (!is.null(panel_title)) {
-            plot_obj <- plot_obj + ggtitle(panel_title)
-        }
-
-        plot_obj
-    }
-
-    generate_density_plots <- function(plot_df, approach_name, x_var) {
-        for (ma_type in names(ma_specs)) {
-            in_var <- ma_specs[[ma_type]]$in_var
-            out_var <- ma_specs[[ma_type]]$out_var
-
-            for (reg_type in regression_specs) {
-                for (year in years) {
-                    for (biz_type in c("online", "local")) {
-                        model_data <- plot_df %>%
-                            filter(
-                                YEAR == year,
-                                type == biz_type,
-                                !is.na(high_tax_side)
-                            ) %>%
-                            select(
-                                GEO_ID, YEAR, type, EMP, lemp, coastal, border, cit,
-                                all_of(c(in_var, out_var, x_var))
-                            ) %>%
-                            drop_na()
-
-                        if (nrow(model_data) == 0) {
-                            next
-                        }
-
-                        if (reg_type == "raw_inh") {
-                            plot_data <- model_data %>%
-                                mutate(plot_resid = lemp)
-                        } else {
-                            regression_formula <- as.formula(
-                                paste(
-                                    ifelse(reg_type == "inh", "lemp", "EMP"),
-                                    "~",
-                                    paste(c(in_var, out_var, "coastal", "border", "cit"), collapse = " + ")
-                                )
-                            )
-
-                            model <- if (reg_type == "inh") {
-                                feols(regression_formula, data = model_data)
-                            } else {
-                                glm(
-                                    regression_formula,
-                                    family = poisson(link = "log"),
-                                    data = model_data
-                                )
-                            }
-
-                            plot_data <- model_data %>%
-                                mutate(plot_resid = residuals(model))
-                        }
-
-                        q_resid <- quantile(plot_data$plot_resid, probs = c(.01, .99), na.rm = TRUE)
-                        plot_data <- plot_data %>%
-                            mutate(plot_resid = pmin(pmax(plot_resid, q_resid[1]), q_resid[2]))
-
-                        output_dir <- file.path("output", approach_name, ma_type, reg_type, biz_type)
-                        dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
-
-                        panel_title <- paste(
-                            ifelse(ma_type == "linear", "Linear access", "Exponential access"),
-                            ifelse(approach_name == "unique_border", "Unique border", "Unique county"),
-                            sep = " + "
-                        )
-
-                        plot_obj <- build_plot(
-                            plot_data = plot_data,
-                            x_var = x_var,
-                            biz_type = biz_type,
-                            panel_title = panel_title
-                        )
-
-                        ggsave(file.path(output_dir, paste0(year, ".png")), plot = plot_obj)
-
-                        if (reg_type == "ppml" && biz_type == "online" && year %in% summary_years) {
-                            summary_key <- paste(year, ma_type, approach_name, sep = "__")
-                            summary_plot_registry[[summary_key]] <<- plot_obj
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    generate_density_plots(
-        plot_df = border_county_year_naics,
-        approach_name = "unique_border",
-        x_var = "dist_to_border_adj"
-    )
-
-    # Unique county approach
-    generate_density_plots(
-        plot_df = main,
-        approach_name = "unique_county",
-        x_var = "dist_to_border_signed"
-    )
-
-    summary_output_dir <- file.path("output", "summary", "ppml", "online")
-    dir.create(summary_output_dir, recursive = TRUE, showWarnings = FALSE)
-
-    for (year in summary_years) {
-        summary_plot <- (
-            summary_plot_registry[[paste(year, "linear", "unique_border", sep = "__")]] +
-            summary_plot_registry[[paste(year, "linear", "unique_county", sep = "__")]]
-        ) / (
-            summary_plot_registry[[paste(year, "expo", "unique_border", sep = "__")]] +
-            summary_plot_registry[[paste(year, "expo", "unique_county", sep = "__")]]
-        ) +
-            plot_annotation(title = paste("PPML residualized employment in online industry,", year))
-
-        ggsave(
-            filename = file.path(summary_output_dir, paste0(year, ".png")),
-            plot = summary_plot,
-            width = 14,
-            height = 10
-        )
-    }
-
+        summary(butt_expo_rdd)
