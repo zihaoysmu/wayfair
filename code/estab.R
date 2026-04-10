@@ -218,7 +218,6 @@ options(tigris_use_cache = TRUE)
         mutate(
             tax_diff = sales_tax - tax_other,
             tax_diff_abs = abs(tax_diff),
-            tax_diff_abs_c = tax_diff_abs - mean(tax_diff_abs, na.rm = TRUE),
             high_tax_side = case_when(
                 is.na(state_other) ~ NA_integer_,
                 sales_tax > tax_other ~ 1L,
@@ -284,7 +283,8 @@ options(tigris_use_cache = TRUE)
                     cluster = group_data$GEO_ID,
                     vce = "hc1",
                     masspoints = "adjust",
-                    h = bw
+                    h = bw,
+                    b = bw
                 )
 
                 tibble(
@@ -328,10 +328,13 @@ options(tigris_use_cache = TRUE)
             lemp ~ dist_to_border_signed + S + S:dist_to_border_signed +
                 Tt + Tt:dist_to_border_signed +
                 S:Tt + S:Tt:dist_to_border_signed +
-                S:tax_diff_abs_c + Tt:tax_diff_abs_c + S:Tt:tax_diff_abs_c +
-                lma_in_expo + lma_out_expo + cit + pop |
+                # heterogeneity terms: full interactions
+                tax_diff + Tt:tax_diff + Tt:dist_to_border_signed:tax_diff + S:Tt:tax_diff + Tt:S:dist_to_border_signed:tax_diff
+                + S:tax_diff + dist_to_border_signed:tax_diff + S:dist_to_border_signed:tax_diff + 
+                + lma_in_expo:tax_diff + lma_out_expo:tax_diff + cit:tax_diff + pop:tax_diff
+                + lma_in_expo + lma_out_expo + cit + pop |
                 YEAR + nearest_border,
-            data = grembi_50000,
+            data = grembi_20000,
             cluster = ~GEO_ID
             )
             # S:Tt is beta_0, the parameter of interest
@@ -346,7 +349,57 @@ options(tigris_use_cache = TRUE)
                 se.below = FALSE,               
                 fitstat = c("n", "r2"),    
                 digits = 3,      
-                file = "output/grembi_rdd.tex"
+                file = "output/grembi_rdd_heter.tex"
+            )
+
+        # Dynamic (event study) Grembi approach — mirrors grembi_rdd spec year-by-year
+            # Each Tt × ... term is replaced with i(YEAR_f, ..., ref = "2018")
+            # Static terms (no Tt): dist_to_border_signed, S, S:dist_to_border_signed, S:tax_diff_abs
+            grembi_event <- grembi_20000 %>%
+                mutate(
+                    YEAR_f      = factor(YEAR),
+                    S_slope     = S * dist_to_border_signed,          # Tt:S:dist  → i(YEAR_f, S_slope)
+                    dist_tax    = dist_to_border_signed * tax_diff_abs, # Tt:dist:tax_diff → i(YEAR_f, dist_tax)
+                    S_slope_tax = S * dist_to_border_signed * tax_diff_abs  # Tt:S:dist:tax_diff → i(YEAR_f, S_slope_tax)
+                )
+
+            grembi_event_rdd <- feols(
+                lemp ~ dist_to_border_signed + S + S:dist_to_border_signed +
+                    S:tax_diff_abs +                                        # static: S × tax_diff (no Tt)
+                    i(YEAR_f, dist_to_border_signed, ref = "2018") +       # Tt:dist
+                    i(YEAR_f, S,           ref = "2018") +                 # S:Tt ← key dynamic effect
+                    i(YEAR_f, S_slope,     ref = "2018") +                 # S:Tt:dist
+                    i(YEAR_f, tax_diff_abs, ref = "2018") +                # Tt:tax_diff
+                    i(YEAR_f, dist_tax,    ref = "2018") +                 # Tt:dist:tax_diff
+                    i(YEAR_f, S_slope_tax, ref = "2018") +                 # Tt:S:dist:tax_diff
+                    lma_in_expo + lma_out_expo + cit + pop |
+                    YEAR + nearest_border,
+                data    = grembi_event,
+                cluster = ~GEO_ID
+            )
+            summary(grembi_event_rdd)
+
+            # Event-study plot: coefficient on i(YEAR_f, S) = S:Tt by year (ref = 2018)
+            iplot(grembi_event_rdd,
+                i.select = 2,          # second i() term = i(YEAR_f, S, ...)
+                main  = "Dynamic Treatment Effects (Grembi RDD-DiD, bw=20km)",
+                xlab  = "Year",
+                ylab  = "Coefficient on S × Year (ref = 2018)"
+            )
+            abline(v = 2018.5, lty = 2, col = "red")  # Wayfair decision cutoff
+
+            # Save event-study coefficients as table
+            etable(grembi_event_rdd,
+                tex = TRUE,
+                style.tex = style.tex(
+                    main = "aer",
+                    notes.tpt.intro = ""
+                ),
+                drop = "YEAR|nearest_border",
+                se.below = FALSE,
+                fitstat = c("n", "r2"),
+                digits = 3,
+                file = "output/grembi_rdd_dynamic.tex"
             )
 
 
@@ -362,7 +415,7 @@ options(tigris_use_cache = TRUE)
                    d_lma_in = lma_in - lag(lma_in),
                    d_lma_out = lma_out - lag(lma_out),
                    d_cit = cit - lag(cit),
-                   d_tax_diff_abs_c = tax_diff_abs_c - lag(tax_diff_abs_c),
+                   d_tax_diff_abs = tax_diff_abs - lag(tax_diff_abs),
                    d_pop = pop - lag(pop)) %>%
             ungroup() %>%
             drop_na()
@@ -370,11 +423,12 @@ options(tigris_use_cache = TRUE)
         butt_rdd <- rdrobust(
             y = butt$d_lemp,
             x = butt$dist_to_border_signed,
-            covs = cbind(butt$d_lma_in, butt$d_lma_out, butt$d_cit, butt$d_pop, butt$d_tax_diff_abs_c),
+            covs = cbind(butt$d_lma_in, butt$d_lma_out, butt$d_cit, butt$d_pop, butt$d_tax_diff_abs),
             cluster = butt$GEO_ID,
             vce = "hc1",
             masspoints = "adjust",
-            h = 50
+            h = 50,
+            b = 50
         )
         summary(butt_rdd)
         butt_summary <- as.data.frame(tibble(
@@ -439,6 +493,85 @@ options(tigris_use_cache = TRUE)
             cluster = butt_expo$GEO_ID,
             vce = "hc1",
             masspoints = "adjust",
-            h = 50
+            h = 50,
+            b = 50
         )
         summary(butt_expo_rdd)
+
+
+# Cross-sectional RDD plot - unique county + linear MA
+test = main %>%
+select(dist_to_border_signed) %>%
+arrange(dist_to_border_signed)
+
+# Cross-sectional RDD by year ----
+    bw_cs <- 20   # bandwidth in km
+
+    rdd_by_year <- lapply(years, function(yr) {
+        yr_data <- main %>%
+            filter(YEAR == yr, type == "online") %>%
+            select(GEO_ID, YEAR, STATEFP, lemp, dist_to_border_signed,
+                   lma_in, lma_out, cit, nearest_border, pop) %>%
+            drop_na()
+
+        # keep border pairs with counties on both sides within bandwidth
+        in_bw <- yr_data %>% filter(abs(dist_to_border_signed) <= bw_cs)
+        valid_pairs <- in_bw %>%
+            mutate(side = ifelse(dist_to_border_signed > 0, "right", "left")) %>%
+            group_by(nearest_border) %>%
+            summarise(n_sides = n_distinct(side), .groups = "drop") %>%
+            filter(n_sides == 2) %>%
+            pull(nearest_border)
+
+        yr_data <- yr_data %>% filter(nearest_border %in% valid_pairs)
+        if (nrow(yr_data) < 10) return(NULL)
+
+        pair_dummies <- model.matrix(~ factor(nearest_border), data = yr_data)[, -1, drop = FALSE]
+        covs_mat <- cbind(yr_data$lma_in, yr_data$lma_out,
+                          yr_data$cit, yr_data$pop, pair_dummies)
+        covs_mat <- covs_mat[, qr(covs_mat)$pivot[seq_len(qr(covs_mat)$rank)], drop = FALSE]
+
+        rdd_fit <- tryCatch(
+            rdrobust(
+                y        = yr_data$lemp,
+                x        = yr_data$dist_to_border_signed,
+                covs     = covs_mat,
+                cluster  = yr_data$GEO_ID,
+                vce      = "hc1",
+                masspoints = "adjust"
+            ),
+            error = function(e) NULL
+        )
+        if (is.null(rdd_fit)) return(NULL)
+
+        tibble(
+            year  = yr,
+            N     = nrow(yr_data),
+            coef  = rdd_fit$coef[3],
+            se    = rdd_fit$se[3],
+            ci_l  = rdd_fit$ci[3, 1],
+            ci_r  = rdd_fit$ci[3, 2],
+            p     = rdd_fit$pv[3]
+        )
+    })
+
+    rdd_by_year_df <- bind_rows(rdd_by_year)
+
+    # Plot: coefficient + 95% CI by year
+    p_rdd_year <- ggplot(rdd_by_year_df, aes(x = year, y = coef)) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+        geom_vline(xintercept = 2018.5, linetype = "dashed", color = "red", linewidth = 0.7) +
+        geom_errorbar(aes(ymin = ci_l, ymax = ci_r), width = 0.25, linewidth = 0.7) +
+        geom_point(size = 2.5) +
+        annotate("text", x = 2018.5, y = Inf, label = "Wayfair", vjust = 1.5,
+                 hjust = -0.1, color = "red", size = 3.5) +
+        scale_x_continuous(breaks = years) +
+        labs(
+            title = paste0("Cross-sectional RDD Estimates by Year (bw = ", bw_cs, " km)"),
+            x     = "Year",
+            y     = "Discontinuity Estimate (95% CI)"
+        ) +
+        theme_bw()
+
+    ggsave("output/rdd_by_year.pdf", p_rdd_year, width = 8, height = 5)
+    print(p_rdd_year)

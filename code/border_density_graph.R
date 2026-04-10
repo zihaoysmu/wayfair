@@ -3,7 +3,7 @@ source("code/setup.R")
 
 
 # border density graph ----
-# Dependencies (must have run estab.R first):
+# Dependencies (*must have run estab.R first*):
 #   state_border, county_cent, counties_sf, main, state_tax_lookup, years
 
     ## hard to decide which county belongs to which border

@@ -29,7 +29,7 @@ raw_cbp_2019 <- read.csv("C:/document/SMU PhD/research/Data/County Business Patt
 raw_cbp_2020 <- read.csv("C:/document/SMU PhD/research/Data/County Business Pattern/CBP2020.CB2000CBP-Data.csv")
 raw_cbp_2021 <- read.csv("C:/document/SMU PhD/research/Data/County Business Pattern/CBP2021.CB2100CBP-Data.csv")
 raw_cbp_2022 <- read.csv("C:/document/SMU PhD/research/Data/County Business Pattern/CBP2022.CB2200CBP-Data.csv")
-raw_pop <- read_xlsx("C:/document/SMU PhD/research/Data/Census Population Estimates Program/co-est2020int-pop.xlsx")
+raw_pop <- read_xlsx("C:/document/SMU PhD/research/Data/Census Population Estimates Program/2010-2025 county pop.xlsx")
 raw_gdp <- read.csv("data/raw/county_gdp.csv")
 raw_consumption <- read.csv("data/raw/consumption.csv")
 raw_IRPD <- read.csv("data/raw/IRPD.csv")
@@ -374,3 +374,8 @@ write.csv(cbp, "data/temp/cbp_temp.csv", row.names = FALSE)
 write.csv(gdp, "data/temp/gdp_temp.csv", row.names = FALSE)
 write.csv(market, "data/temp/market_temp.csv", row.names = FALSE)
 write.csv(main, "data/temp/state_con_tax.csv", row.names = FALSE)
+
+# pairs オブジェクトが残っていれば
+pairs %>%
+    filter(dist_km < 1) %>%
+    arrange(dist_km)
