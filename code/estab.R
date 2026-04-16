@@ -68,6 +68,17 @@ options(tigris_use_cache = TRUE)
         any(cty$STATEFP[nbr] != cty$STATEFP[i])
     }, logical(1))
     cty$is_boundary_county = boundary
+    # 3.5) extract cross-state adjacent county pairs (bidirectional)
+    cross_state_pairs <- rbindlist(lapply(seq_len(nrow(cty)), function(i) {
+        nbr <- nb[[i]]
+        cross_nbr <- nbr[cty$STATEFP[nbr] != cty$STATEFP[i]]
+        if (length(cross_nbr) == 0) return(NULL)
+        data.table(GEO_ID = cty$GEOID[i], GEO_ID_neighbor = cty$GEOID[cross_nbr])
+    })) %>%
+        as_tibble() %>%
+        mutate(pair_id = paste(pmin(GEO_ID, GEO_ID_neighbor),
+                               pmax(GEO_ID, GEO_ID_neighbor),
+                               sep = "-"))
     # 4)costalline
     coastline <- ne_download(
         scale = "medium",
@@ -134,15 +145,31 @@ options(tigris_use_cache = TRUE)
     state_border <- st_transform(state_border, 5070)
 
     county_cent <- st_centroid(counties_sf)
-    nearest_id <- st_nearest_feature(county_cent, state_border)
+    nearest_id  <- st_nearest_feature(county_cent, state_border)
 
-    nearest_pts <- st_nearest_points(
-        county_cent,
-        state_border[nearest_id, ],
+    # Chordal distance: find nearest border point in geographic CRS,
+    # then compute 3-D Euclidean distance through the Earth (chord length)
+    county_cent_geo  <- st_transform(county_cent,  4326)
+    state_border_geo <- st_transform(state_border, 4326)
+
+    nearest_pts_geo <- st_nearest_points(
+        county_cent_geo,
+        state_border_geo[nearest_id, ],
         pairwise = TRUE
     )
 
-    counties_sf$dist_to_border <- as.numeric(st_length(nearest_pts)) / 1000
+    # converting to chordal distance
+    coords_mat <- st_coordinates(nearest_pts_geo)          # 2 rows per segment
+    from_lon <- coords_mat[seq(1, nrow(coords_mat), 2), "X"] * pi / 180
+    from_lat <- coords_mat[seq(1, nrow(coords_mat), 2), "Y"] * pi / 180
+    to_lon   <- coords_mat[seq(2, nrow(coords_mat), 2), "X"] * pi / 180
+    to_lat   <- coords_mat[seq(2, nrow(coords_mat), 2), "Y"] * pi / 180
+
+    R_earth <- 6371   # km
+    x1 <- cos(from_lat) * cos(from_lon); y1 <- cos(from_lat) * sin(from_lon); z1 <- sin(from_lat)
+    x2 <- cos(to_lat)   * cos(to_lon);   y2 <- cos(to_lat)   * sin(to_lon);   z2 <- sin(to_lat)
+
+    counties_sf$dist_to_border <- R_earth * sqrt((x2-x1)^2 + (y2-y1)^2 + (z2-z1)^2)
     counties_sf$nearest_border <- state_border$border_name[nearest_id]
 
     rm(coastline, countries, border_line, nb, neighbors, usa, states_pre)
@@ -181,10 +208,10 @@ options(tigris_use_cache = TRUE)
 
     # drop county with only one year obs and na
     main <- main %>% 
-    group_by(GEO_ID) %>% 
-    filter(n() > 1) %>% 
-    ungroup() %>% 
-    drop_na()
+        group_by(GEO_ID) %>% 
+        filter(n() > 1) %>% 
+        ungroup() %>% 
+        drop_na()
 
     years <- 2015:2022
 
@@ -197,7 +224,7 @@ options(tigris_use_cache = TRUE)
         select(YEAR, state, state_abbr, sales_tax, cit) %>%
         distinct()
 
-    # Distance to border is in meters
+    # Distance to border is in km
     main <- main %>%
         left_join(county_border_lookup, by = "GEO_ID") %>%
         mutate(
@@ -226,17 +253,41 @@ options(tigris_use_cache = TRUE)
             dist_to_border_signed = dist_to_border * high_tax_side
         )
 
+# border county pairs ----
+    # Each row = focal county × one cross-state neighbor × year × NAICS type
+    # Both counties in a pair appear (one as focal, one as neighbor), linked by pair_id
+    border_county_pairs <- cross_state_pairs %>%
+        left_join(main, by = "GEO_ID")
 
 # regression ----
-    # FE OLS
-    reg <- feols(
-        lemp ~ 
-        lma_in + lma_out + lma_tax_in + lma_tax_in * I(YEAR >= 2019) + lma_tax_out + lma_tax_out * I(YEAR >= 2019) + cit + pop |YEAR + GEO_ID,
-        data = main,
+    # PPML (Poisson PML) — dependent variable in levels (EMP), coefficients are semi-elasticities
+    reg <- fepois(
+        EMP ~
+        lma_in + lma_out + lma_tax_in + lma_tax_in * I(YEAR >= 2019) + lma_tax_out + lma_tax_out * I(YEAR >= 2019) + cit + pop | YEAR + GEO_ID,
+        data = main %>% filter(type == "online"),
         cluster = ~STATEFP
     )
 
-    # RDD 
+    # Subsample: counties within 50km of a state border
+    reg_border50 <- fepois(
+        EMP ~
+        lma_in + lma_out + lma_tax_in + lma_tax_in * I(YEAR >= 2019) + lma_tax_out + lma_tax_out * I(YEAR >= 2019) + cit + pop | YEAR + GEO_ID,
+        data = main %>% filter(abs(dist_to_border_signed) <= 50 & type == "online"),
+        cluster = ~STATEFP
+    )
+
+    etable(reg, reg_border50,
+        headers = c("Full sample", "Border 50km"),
+        tex = TRUE,
+        style.tex = style.tex(main = "aer", notes.tpt.intro = ""),
+        drop = "GEO_ID",
+        se.below = FALSE,
+        fitstat = c("n", "r2"),
+        digits = 3,
+        file = "output/reg_border50.tex"
+    )
+
+    # RDD
         # my approach
         panel_groups <- list(
             `2015-2018` = 2015:2018,
@@ -401,9 +452,8 @@ options(tigris_use_cache = TRUE)
                 digits = 3,
                 file = "output/grembi_rdd_dynamic.tex"
             )
-
-
-        # Butts 2023 approach
+            
+        # Butts 2023 approach ----
         # first difference
         butt <- main %>%
             filter(type == "online") %>%
@@ -498,67 +548,117 @@ options(tigris_use_cache = TRUE)
         )
         summary(butt_expo_rdd)
 
+# Continuous treatment reg ----
+    # Y = β·T_{s(i),t} + f_p(R_i) + γ_p + δ_t + ε
+    # T = tax_diff (jumps at border); f_p(R) = pair-specific local linear in dist
+    # β: effect of 1pp tax difference on log employment
+    cont_data <- main %>%
+        filter(type == "online") %>% 
+        filter(YEAR < 2019)
 
-# Cross-sectional RDD plot - unique county + linear MA
-test = main %>%
-select(dist_to_border_signed) %>%
-arrange(dist_to_border_signed)
+    cont_20 <- cont_data %>% filter(abs(dist_to_border_signed) <= 20)
+    cont_50 <- cont_data %>% filter(abs(dist_to_border_signed) <= 50)
+
+    # nearest_border[dist_to_border_signed] = pair-specific slope on distance (f_p(R))
+    cont_rdd_20 <- feols(
+        lemp ~ tax_diff_abs + lma_in + lma_out + cit + pop + tax_diff_abs:dist_to_border_signed |
+            YEAR + nearest_border[dist_to_border_signed],
+        data = cont_20,
+        cluster = ~GEO_ID
+    )
+
+    cont_rdd_50 <- feols(
+        lemp ~ tax_diff_abs + lma_in + lma_out + cit + pop + tax_diff_abs:dist_to_border_signed |
+            YEAR + nearest_border[dist_to_border_signed],
+        data = cont_50,
+        cluster = ~GEO_ID
+    )
+
+    summary(cont_rdd_20)
+    summary(cont_rdd_50)
+
+    etable(cont_rdd_20, cont_rdd_50,
+        headers = c("h = 20km", "h = 50km"),
+        tex = TRUE,
+        style.tex = style.tex(main = "aer", notes.tpt.intro = ""),
+        drop = "YEAR|nearest_border",
+        se.below = FALSE,
+        fitstat = c("n", "r2"),
+        digits = 3,
+        file = "output/cont_treatment_rdd.tex"
+    )
 
 # Cross-sectional RDD by year ----
-    bw_cs <- 20   # bandwidth in km
+#   Three bandwidth specifications are compared:
+#   1) Fixed 20 km  — tight window, less bias but more variance
+#   2) Fixed 50 km  — wider window, more power but higher bias risk
+#   3) Automatic     — MSE-optimal bandwidth chosen by rdrobust (Calonico et al.)
+# Each plot shows the discontinuity estimate with 90% CI across years.
 
-    rdd_by_year <- lapply(years, function(yr) {
-        yr_data <- main %>%
-            filter(YEAR == yr, type == "online") %>%
-            select(GEO_ID, YEAR, STATEFP, lemp, dist_to_border_signed,
-                   lma_in, lma_out, cit, nearest_border, pop) %>%
-            drop_na()
+# Helper: run cross-sectional RDD for one year
+# bw_km = numeric → fixed bandwidth; bw_km = NULL → let rdrobust pick optimal
+run_rdd_year <- function(yr, bw_km = NULL) {
+    yr_data <- main %>%
+        filter(YEAR == yr, type == "online") %>%
+        select(GEO_ID, YEAR, STATEFP, lemp, dist_to_border_signed,
+               lma_in, lma_out, cit, nearest_border, pop) %>%
+        drop_na()
 
-        # keep border pairs with counties on both sides within bandwidth
-        in_bw <- yr_data %>% filter(abs(dist_to_border_signed) <= bw_cs)
+    # For fixed bandwidth: keep only border pairs that have counties on both
+    # sides within the bandwidth (ensures each pair contributes a contrast).
+    # For auto bandwidth: use all data and let rdrobust decide the window.
+    if (!is.null(bw_km)) {
+        in_bw <- yr_data %>% filter(abs(dist_to_border_signed) <= bw_km)
         valid_pairs <- in_bw %>%
             mutate(side = ifelse(dist_to_border_signed > 0, "right", "left")) %>%
             group_by(nearest_border) %>%
             summarise(n_sides = n_distinct(side), .groups = "drop") %>%
             filter(n_sides == 2) %>%
             pull(nearest_border)
-
         yr_data <- yr_data %>% filter(nearest_border %in% valid_pairs)
-        if (nrow(yr_data) < 10) return(NULL)
+    }
+    if (nrow(yr_data) < 10) return(NULL)
 
-        pair_dummies <- model.matrix(~ factor(nearest_border), data = yr_data)[, -1, drop = FALSE]
-        covs_mat <- cbind(yr_data$lma_in, yr_data$lma_out,
-                          yr_data$cit, yr_data$pop, pair_dummies)
-        covs_mat <- covs_mat[, qr(covs_mat)$pivot[seq_len(qr(covs_mat)$rank)], drop = FALSE]
+    # Covariates: local-market access, CIT rate, population, + border-pair FE
+    pair_dummies <- model.matrix(~ factor(nearest_border), data = yr_data)[, -1, drop = FALSE]
+    covs_mat <- cbind(yr_data$lma_in, yr_data$lma_out,
+                      yr_data$cit, yr_data$pop, pair_dummies)
+    # Drop collinear columns to avoid rank-deficiency
+    covs_mat <- covs_mat[, qr(covs_mat)$pivot[seq_len(qr(covs_mat)$rank)], drop = FALSE]
 
-        rdd_fit <- tryCatch(
-            rdrobust(
-                y        = yr_data$lemp,
-                x        = yr_data$dist_to_border_signed,
-                covs     = covs_mat,
-                cluster  = yr_data$GEO_ID,
-                vce      = "hc1",
-                masspoints = "adjust"
-            ),
-            error = function(e) NULL
-        )
-        if (is.null(rdd_fit)) return(NULL)
+    # Build rdrobust arguments; omit h/b when bw_km is NULL (auto selection)
+    rdd_args <- list(
+        y          = yr_data$lemp,
+        x          = yr_data$dist_to_border_signed,
+        covs       = covs_mat,
+        cluster    = yr_data$nearest_border,
+        masspoints = "adjust",
+        level      = 90
+    )
+    if (!is.null(bw_km)) {
+        rdd_args$h <- bw_km
+        rdd_args$b <- bw_km
+    }
 
-        tibble(
-            year  = yr,
-            N     = nrow(yr_data),
-            coef  = rdd_fit$coef[3],
-            se    = rdd_fit$se[3],
-            ci_l  = rdd_fit$ci[3, 1],
-            ci_r  = rdd_fit$ci[3, 2],
-            p     = rdd_fit$pv[3]
-        )
-    })
+    rdd_fit <- tryCatch(do.call(rdrobust, rdd_args), error = function(e) NULL)
+    if (is.null(rdd_fit)) return(NULL)
 
-    rdd_by_year_df <- bind_rows(rdd_by_year)
+    # Use robust bias-corrected inference (row 3 of rdrobust output)
+    tibble(
+        year  = yr,
+        N     = nrow(yr_data),
+        bw_h  = rdd_fit$bws[1, 1],   # actual bandwidth used (h)
+        coef  = rdd_fit$coef[3],
+        se    = rdd_fit$se[3],
+        ci_l  = rdd_fit$ci[3, 1],
+        ci_r  = rdd_fit$ci[3, 2],
+        p     = rdd_fit$pv[3]
+    )
+}
 
-    # Plot: coefficient + 95% CI by year
-    p_rdd_year <- ggplot(rdd_by_year_df, aes(x = year, y = coef)) +
+# Helper: plot RDD coefficients by year 
+plot_rdd_by_year <- function(df, title_label) {
+    ggplot(df, aes(x = year, y = coef)) +
         geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
         geom_vline(xintercept = 2018.5, linetype = "dashed", color = "red", linewidth = 0.7) +
         geom_errorbar(aes(ymin = ci_l, ymax = ci_r), width = 0.25, linewidth = 0.7) +
@@ -567,11 +667,61 @@ arrange(dist_to_border_signed)
                  hjust = -0.1, color = "red", size = 3.5) +
         scale_x_continuous(breaks = years) +
         labs(
-            title = paste0("Cross-sectional RDD Estimates by Year (bw = ", bw_cs, " km)"),
+            title = paste0("Cross-sectional RDD Estimates by Year (", title_label, ")"),
             x     = "Year",
-            y     = "Discontinuity Estimate (95% CI)"
+            y     = "Discontinuity Estimate (90% CI)"
         ) +
         theme_bw()
+}
 
-    ggsave("output/rdd_by_year.pdf", p_rdd_year, width = 8, height = 5)
-    print(p_rdd_year)
+# Run and plot for each bandwidth specification
+
+# 1) Fixed bandwidth = 20 km
+rdd_20_df <- bind_rows(lapply(years, run_rdd_year, bw_km = 20))
+p_rdd_20  <- plot_rdd_by_year(rdd_20_df, "bw = 20 km")
+ggsave("output/rdd_by_year_20.pdf", p_rdd_20, width = 8, height = 5)
+print(p_rdd_20)
+
+# 2) Fixed bandwidth = 50 km
+rdd_50_df <- bind_rows(lapply(years, run_rdd_year, bw_km = 50))
+p_rdd_50  <- plot_rdd_by_year(rdd_50_df, "bw = 50 km")
+ggsave("output/rdd_by_year_50.pdf", p_rdd_50, width = 8, height = 5)
+print(p_rdd_50)
+
+# 3) MSE-optimal bandwidth (automatically selected by rdrobust per year)
+rdd_auto_df <- bind_rows(lapply(years, run_rdd_year, bw_km = NULL))
+p_rdd_auto  <- plot_rdd_by_year(rdd_auto_df, "optimal bw")
+ggsave("output/rdd_by_year_optimal.pdf", p_rdd_auto, width = 8, height = 5)
+print(p_rdd_auto)
+print(rdd_auto_df %>% select(year, bw_h))
+# Bandwidth county maps — which counties fall within 20 km and 50 km of a border ----
+
+# Shift geometry helper for AK/HI inset (not needed here since we exclude them,
+# but we use the same counties_sf which already excludes non-contiguous states)
+
+map_bandwidth_counties <- function(bw_km) {
+    counties_map <- counties_sf %>%
+        mutate(kept = ifelse(dist_to_border <= bw_km, "Within bandwidth", "Outside bandwidth"))
+
+    ggplot() +
+        geom_sf(data = counties_map, aes(fill = kept), color = "grey80", linewidth = 0.05) +
+        geom_sf(data = states_sf %>% st_transform(5070), fill = NA, color = "black", linewidth = 0.3) +
+        scale_fill_manual(
+            values = c("Within bandwidth" = "#2166AC", "Outside bandwidth" = "grey90"),
+            name = NULL
+        ) +
+        labs(title = paste0("Counties within ", bw_km, " km of a state border")) +
+        theme_void() +
+        theme(
+            legend.position = "bottom",
+            plot.title = element_text(hjust = 0.5, size = 14)
+        )
+}
+
+p_bw20 <- map_bandwidth_counties(20)
+p_bw50 <- map_bandwidth_counties(50)
+
+ggsave("output/bandwidth_map_20km.png", p_bw20, width = 10, height = 7)
+ggsave("output/bandwidth_map_50km.png", p_bw50, width = 10, height = 7)
+print(p_bw20)
+print(p_bw50)

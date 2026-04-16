@@ -116,6 +116,7 @@ source("code/setup.R")
         plot_obj
     }
 
+    # function：sort data, calculate residuals, winsorize, plot, and save
     generate_density_plots <- function(plot_df, approach_name, x_var) {
         for (ma_type in names(ma_specs)) {
             in_var <- ma_specs[[ma_type]]$in_var
@@ -151,7 +152,7 @@ source("code/setup.R")
                                     paste(c(in_var, out_var, "coastal", "border", "cit", "pop"), collapse = " + ")
                                 )
                             )
-
+                            # estimation specifications
                             model <- if (reg_type == "inh") {
                                 feols(regression_formula, data = model_data)
                             } else {
@@ -199,14 +200,14 @@ source("code/setup.R")
     }
 
     generate_density_plots(
-        plot_df = border_county_year_naics,
+        plot_df = border_county_year_naics %>% filter(dist_to_border <= 100),
         approach_name = "unique_border",
         x_var = "dist_to_border_adj"
     )
 
     # Unique county approach
     generate_density_plots(
-        plot_df = main,
+        plot_df = main %>% filter(dist_to_border <= 100),
         approach_name = "unique_county",
         x_var = "dist_to_border_signed"
     )
