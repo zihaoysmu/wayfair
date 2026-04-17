@@ -111,44 +111,31 @@ options(tigris_use_cache = TRUE)
     cty <- cty %>%
         left_join(pop %>% select(GEO_ID, state), by = c("GEOID" = "GEO_ID"))
 
-# Establishment graph preparation ----
-    # Generate counties and states
-    counties_sf <- counties(cb = TRUE, resolution = "20m", year = 2020) %>% 
-        rename(GEO_ID = GEOID)
-    states_sf   <- states(cb = TRUE, resolution = "20m", year = 2020)
-
+# County distance to nearest state border ----
+    # Exclude AK, HI, PR, and other territories
     exclude <- c("02", "15", "60", "66", "69", "72", "78")
 
-    counties_sf <- counties_sf %>%
-        filter(!STATEFP %in% exclude)
-
-    states_sf <- states_sf %>%
-        filter(!STATEFP %in% exclude)
-
-    # Generate distance to border and which border the county belongs to
-    states_pre <- states_sf %>% 
-        select(STUSPS, STATEFP, NAME) %>% 
+    counties_sf <- counties(cb = TRUE, resolution = "20m", year = 2020) %>%
+        rename(GEO_ID = GEOID) %>%
+        filter(!STATEFP %in% exclude) %>%
         st_transform(5070)
-    state_border <- st_intersection(states_pre, states_pre) %>% 
-        filter(STUSPS != STUSPS.1) %>% 
-        mutate(
-        border_name = paste0(
-            pmin(STUSPS, STUSPS.1),
-            "-",
-            pmax(STUSPS, STUSPS.1)
-        )
-        ) %>% 
-        group_by(border_name) %>% 
+
+    # State border segments (unique state-pair boundaries)
+    states_pre <- states(cb = TRUE, resolution = "20m", year = 2020) %>%
+        filter(!STATEFP %in% exclude) %>%
+        select(STUSPS, STATEFP, NAME) %>%
+        st_transform(5070)
+    state_border <- st_intersection(states_pre, states_pre) %>%
+        filter(STUSPS != STUSPS.1) %>%
+        mutate(border_name = paste0(pmin(STUSPS, STUSPS.1), "-", pmax(STUSPS, STUSPS.1))) %>%
+        group_by(border_name) %>%
         summarize(geometry = st_union(geometry), .groups = "drop")
-
-    counties_sf  <- st_transform(counties_sf, 5070)
-    state_border <- st_transform(state_border, 5070)
-
-    county_cent <- st_centroid(counties_sf)
-    nearest_id  <- st_nearest_feature(county_cent, state_border)
 
     # Chordal distance: find nearest border point in geographic CRS,
     # then compute 3-D Euclidean distance through the Earth (chord length)
+    county_cent <- st_centroid(counties_sf)
+    nearest_id  <- st_nearest_feature(county_cent, state_border)
+
     county_cent_geo  <- st_transform(county_cent,  4326)
     state_border_geo <- st_transform(state_border, 4326)
 
@@ -158,8 +145,7 @@ options(tigris_use_cache = TRUE)
         pairwise = TRUE
     )
 
-    # converting to chordal distance
-    coords_mat <- st_coordinates(nearest_pts_geo)          # 2 rows per segment
+    coords_mat <- st_coordinates(nearest_pts_geo)
     from_lon <- coords_mat[seq(1, nrow(coords_mat), 2), "X"] * pi / 180
     from_lat <- coords_mat[seq(1, nrow(coords_mat), 2), "Y"] * pi / 180
     to_lon   <- coords_mat[seq(2, nrow(coords_mat), 2), "X"] * pi / 180
@@ -172,7 +158,34 @@ options(tigris_use_cache = TRUE)
     counties_sf$dist_to_border <- R_earth * sqrt((x2-x1)^2 + (y2-y1)^2 + (z2-z1)^2)
     counties_sf$nearest_border <- state_border$border_name[nearest_id]
 
-    rm(coastline, countries, border_line, nb, neighbors, usa, states_pre)
+    # Minimum chordal distance from county polygon edge to nearest state border
+    counties_geo     <- st_transform(counties_sf, 4326)
+    nearest_pts_edge <- st_nearest_points(
+        counties_geo,
+        state_border_geo[nearest_id, ],
+        pairwise = TRUE
+    )
+    # Cast to LINESTRING so st_coordinates works (each line = 2 rows: from, to)
+    lines_edge  <- st_cast(nearest_pts_edge, "LINESTRING")
+    coords_edge <- st_coordinates(lines_edge)
+    e_from_lon <- coords_edge[seq(1, nrow(coords_edge), 2), "X"] * pi / 180
+    e_from_lat <- coords_edge[seq(1, nrow(coords_edge), 2), "Y"] * pi / 180
+    e_to_lon   <- coords_edge[seq(2, nrow(coords_edge), 2), "X"] * pi / 180
+    e_to_lat   <- coords_edge[seq(2, nrow(coords_edge), 2), "Y"] * pi / 180
+
+    ex1 <- cos(e_from_lat) * cos(e_from_lon); ey1 <- cos(e_from_lat) * sin(e_from_lon); ez1 <- sin(e_from_lat)
+    ex2 <- cos(e_to_lat)   * cos(e_to_lon);   ey2 <- cos(e_to_lat)   * sin(e_to_lon);   ez2 <- sin(e_to_lat)
+
+    counties_sf$dist_to_border_edge <- R_earth * sqrt((ex2-ex1)^2 + (ey2-ey1)^2 + (ez2-ez1)^2)
+
+    rm(coastline, countries, border_line, nb, neighbors, usa,
+       states_pre, state_border, county_cent, nearest_id,
+       county_cent_geo, state_border_geo, nearest_pts_geo,
+       coords_mat, from_lon, from_lat, to_lon, to_lat,
+       x1, y1, z1, x2, y2, z2, R_earth,
+       counties_geo, nearest_pts_edge, lines_edge, coords_edge,
+       e_from_lon, e_from_lat, e_to_lon, e_to_lat,
+       ex1, ey1, ez1, ex2, ey2, ez2)
 
 
 # combine main ----
@@ -191,6 +204,7 @@ options(tigris_use_cache = TRUE)
             gdp_in = gdp + gdp_in,
             lma_in = log(ma_in),
             lma_out = log(ma_out),
+            lma = lma_in + lma_out,
             lma_in_expo = log(ma_in_new),
             lma_out_expo = log(ma_out_new),
             lemp = asinh(EMP),
@@ -217,7 +231,7 @@ options(tigris_use_cache = TRUE)
 
     county_border_lookup <- counties_sf %>%
         st_drop_geometry() %>%
-        select(GEO_ID, dist_to_border, nearest_border) %>%
+        select(GEO_ID, dist_to_border, dist_to_border_edge, nearest_border) %>%
         separate(nearest_border, into = c("state1", "state2"), sep = "-", remove = FALSE)
 
     state_tax_lookup <- main %>%
@@ -258,6 +272,117 @@ options(tigris_use_cache = TRUE)
     # Both counties in a pair appear (one as focal, one as neighbor), linked by pair_id
     border_county_pairs <- cross_state_pairs %>%
         left_join(main, by = "GEO_ID")
+
+    # Balanced pairs: keep only pairs where BOTH counties have online obs in ALL years
+    balanced_pair_ids <- border_county_pairs %>%
+        filter(type == "online") %>%
+        group_by(pair_id, GEO_ID) %>%
+        summarise(n_years = n_distinct(YEAR), .groups = "drop") %>%
+        group_by(pair_id) %>%
+        filter(all(n_years == length(years))) %>%
+        pull(pair_id) %>%
+        unique()
+
+    border_county_balanced <- border_county_pairs %>%
+        filter(type == "online", pair_id %in% balanced_pair_ids)
+
+
+    # Pair-time FE panel regression
+    pair_reg <- feols(
+        lemp ~
+        lma + lma_tax_in + lma_tax_in * I(YEAR >= 2019) + lma_tax_out + lma_tax_out * I(YEAR >= 2019) + cit + pop | YEAR^pair_id + GEO_ID,
+        data = border_county_balanced %>% filter(type == "online"),
+        cluster = ~STATEFP + nearest_border
+    )
+    summary(pair_reg)
+
+    # Event study: lma_tax_out coefficient by year (ref = 2018)
+    pair_event <- feols(
+        lemp ~
+        lma + lma_tax_in + lma_tax_in * I(YEAR >= 2019) +
+        i(YEAR, lma_tax_out, ref = 2018) +
+        cit + pop | YEAR^pair_id + GEO_ID,
+        data = border_county_balanced %>% filter(type == "online"),
+        cluster = ~STATEFP + nearest_border
+    )
+    summary(pair_event)
+
+    iplot(pair_event,
+        main = "Event Study: lma_tax_out (ref = 2018)",
+        xlab = "Year",
+        ylab = "Coefficient on lma_tax_out"
+    )
+    abline(v = 2018.5, lty = 2, col = "red")
+
+
+
+# Year-by-year OLS ----
+    ols_by_year <- lapply(years, function(y) {
+        feols(
+            lemp ~ lma_in + lma_out + cit + pop + coastal + border + dist_to_border_edge + I(dist_to_border_edge^2),
+            data = main %>% filter(type == "online", YEAR == y),
+            cluster = ~STATEFP + nearest_border
+        )
+    })
+    names(ols_by_year) <- years
+    # Coefficient plot across years
+    coef_names <- names(coef(ols_by_year[[1]]))
+    coef_df <- do.call(rbind, lapply(years, function(y) {
+        est <- ols_by_year[[as.character(y)]]
+        data.frame(
+            year  = y,
+            var   = coef_names,
+            coef  = as.numeric(coef(est)[coef_names]),
+            se    = as.numeric(se(est)[coef_names])
+        )
+    }))
+    coef_df$ci_lo <- coef_df$coef - 1.96 * coef_df$se
+    coef_df$ci_hi <- coef_df$coef + 1.96 * coef_df$se
+
+    n_coef <- length(coef_names)
+    n_col  <- ceiling(n_coef / 2)
+    png("output/ols_by_year.png", width = n_col * 400, height = 900, res = 150)
+    par(mfrow = c(2, n_col), mar = c(4, 4, 2, 1))
+    for (v in coef_names) {
+        d <- coef_df[coef_df$var == v, ]
+        plot(d$year, d$coef, type = "b", pch = 19,
+             ylim = range(c(d$ci_lo, d$ci_hi)),
+             main = v, xlab = "Year", ylab = "Coefficient")
+        arrows(d$year, d$ci_lo, d$year, d$ci_hi,
+               angle = 90, code = 3, length = 0.05, col = "grey40")
+        abline(h = 0, lty = 2, col = "red")
+    }
+    dev.off()
+
+# Year-by-year OLS with restricted cubic splines ----
+    rcs_vars <- c("lemp", "lma_in", "lma_out", "cit", "pop", "coastal", "border", "dist_to_border_edge")
+    ols_rcs_by_year <- lapply(years, function(y) {
+        d <- main %>% filter(type == "online", YEAR == y) %>% st_drop_geometry() %>% select(all_of(rcs_vars)) %>% as.data.frame()
+        dd <- datadist(d)
+        options(datadist = "dd")
+        ols(lemp ~ lma_in + lma_out + cit + pop + coastal + border + rcs(dist_to_border_edge, 4),
+            data = d, x = TRUE, y = TRUE)
+    })
+    names(ols_rcs_by_year) <- years
+
+    # Plot spline effect of dist_to_border_edge by year
+    png("output/ols_rcs_by_year.png", width = 1600, height = 900, res = 150)
+    par(mfrow = c(2, 4), mar = c(4, 4, 3, 1))
+    for (y in years) {
+        d <- main %>% filter(type == "online", YEAR == y) %>% st_drop_geometry() %>% select(all_of(rcs_vars)) %>% as.data.frame()
+        dd <- datadist(d)
+        options(datadist = "dd")
+        p <- Predict(ols_rcs_by_year[[as.character(y)]], dist_to_border_edge)
+        plot(p$dist_to_border_edge, p$yhat, type = "l", lwd = 2,
+             ylim = range(c(p$lower, p$upper)),
+             main = as.character(y), xlab = "Distance to border (edge, km)", ylab = "Partial effect on lemp")
+        polygon(c(p$dist_to_border_edge, rev(p$dist_to_border_edge)),
+                c(p$lower, rev(p$upper)),
+                col = rgb(0, 0, 1, 0.15), border = NA)
+        lines(p$dist_to_border_edge, p$yhat, lwd = 2)
+        abline(h = 0, lty = 2, col = "red")
+    }
+    dev.off()
 
 # regression ----
     # PPML (Poisson PML) — dependent variable in levels (EMP), coefficients are semi-elasticities
@@ -694,34 +819,5 @@ p_rdd_auto  <- plot_rdd_by_year(rdd_auto_df, "optimal bw")
 ggsave("output/rdd_by_year_optimal.pdf", p_rdd_auto, width = 8, height = 5)
 print(p_rdd_auto)
 print(rdd_auto_df %>% select(year, bw_h))
-# Bandwidth county maps — which counties fall within 20 km and 50 km of a border ----
 
-# Shift geometry helper for AK/HI inset (not needed here since we exclude them,
-# but we use the same counties_sf which already excludes non-contiguous states)
 
-map_bandwidth_counties <- function(bw_km) {
-    counties_map <- counties_sf %>%
-        mutate(kept = ifelse(dist_to_border <= bw_km, "Within bandwidth", "Outside bandwidth"))
-
-    ggplot() +
-        geom_sf(data = counties_map, aes(fill = kept), color = "grey80", linewidth = 0.05) +
-        geom_sf(data = states_sf %>% st_transform(5070), fill = NA, color = "black", linewidth = 0.3) +
-        scale_fill_manual(
-            values = c("Within bandwidth" = "#2166AC", "Outside bandwidth" = "grey90"),
-            name = NULL
-        ) +
-        labs(title = paste0("Counties within ", bw_km, " km of a state border")) +
-        theme_void() +
-        theme(
-            legend.position = "bottom",
-            plot.title = element_text(hjust = 0.5, size = 14)
-        )
-}
-
-p_bw20 <- map_bandwidth_counties(20)
-p_bw50 <- map_bandwidth_counties(50)
-
-ggsave("output/bandwidth_map_20km.png", p_bw20, width = 10, height = 7)
-ggsave("output/bandwidth_map_50km.png", p_bw50, width = 10, height = 7)
-print(p_bw20)
-print(p_bw50)
