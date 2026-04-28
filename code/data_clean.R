@@ -37,6 +37,14 @@ raw_wayfair <- read_xlsx("data/raw/wayfair state implemetion timeline.xlsx")
 raw_CFS_2012 <- read.csv("C:/document/SMU PhD/research/sales tax and immigration/Data/CFS/2012/CFSAREA2012.CF1200A30-Data.csv")
 raw_tax <- read.csv("data/temp/tax.csv")
 raw_tax_full <- read_xlsx("data/raw/combined sales tax.xlsx")
+raw_payroll_2015 <- read.csv("data/raw/payroll-CBP/2015.csv")
+raw_payroll_2016 <- read.csv("data/raw/payroll-CBP/2016.csv")
+raw_payroll_2017 <- read.csv("data/raw/payroll-CBP/2017.csv")
+raw_payroll_2018 <- read.csv("data/raw/payroll-CBP/2018.csv")
+raw_payroll_2019 <- read.csv("data/raw/payroll-CBP/2019.csv")
+raw_payroll_2020 <- read.csv("data/raw/payroll-CBP/2020.csv")
+raw_payroll_2021 <- read.csv("data/raw/payroll-CBP/2021.csv")
+raw_payroll_2022 <- read.csv("data/raw/payroll-CBP/2022.csv")
 
 # clean data before 2015 ----
 # # 加入更早的数据 does not add new info or conclusion
@@ -106,17 +114,32 @@ cbp_list <- list(
 )
 
 
+big_codes <- c("241", "242", "251", "252", "254", "260")  # EMPSZES with >=20 employees
+
 cbp_list <- lapply(cbp_list, function(df) {
-  df %>% mutate(ESTAB = as.numeric(ESTAB)) %>% 
+  df <- df %>% mutate(ESTAB = as.numeric(ESTAB)) %>%
     rename_with(~ "NAICS", matches("^NAICS20[0-9]{2}$")) %>%
-    rename_with(~ "NAICS_LABEL", matches("^NAICS20[0-9]{2}_LABEL$")) %>% 
-    filter(EMPSZES_LABEL == "All establishments") %>% 
-    complete(GEO_ID,YEAR, NAICS = c("4541", "4421", "4431", "4451", "4481", "4511", "4512", "4532"), fill = list(ESTAB = 0, EMP = "0")) %>% 
+    rename_with(~ "NAICS_LABEL", matches("^NAICS20[0-9]{2}_LABEL$")) %>%
+    mutate(EMPSZES = as.character(EMPSZES))
+
+  df_all <- df %>%
+    filter(EMPSZES_LABEL == "All establishments") %>%
+    select(GEO_ID, NAME, YEAR, NAICS, ESTAB, EMP)
+
+  df_big <- df %>%
+    filter(EMPSZES %in% big_codes) %>%
+    group_by(GEO_ID, NAME, YEAR, NAICS) %>%
+    summarise(ESTAB_big = sum(ESTAB, na.rm = TRUE), .groups = "drop")
+
+  df_all %>%
+    left_join(df_big, by = c("GEO_ID", "NAME", "YEAR", "NAICS")) %>%
+    mutate(ESTAB_big = ifelse(is.na(ESTAB_big), 0, ESTAB_big)) %>%
+    complete(GEO_ID, YEAR, NAICS = c("4541", "4421", "4431", "4451", "4481", "4511", "4512", "4532"), fill = list(ESTAB = 0, ESTAB_big = 0, EMP = "0")) %>%
     filter(NAICS %in% c("4541", "4421", "4431", "4451", "4481", "4511", "4512", "4532")) %>% # Add other retail sectors for placebo test
-    mutate(NAICS = ifelse(NAICS == "4541", "4541", "0")) %>% 
-    select(GEO_ID, NAME, YEAR, NAICS, ESTAB, EMP) %>% 
-    left_join(name_map, by = "GEO_ID", suffix = c("", "_map")) %>% 
-    mutate(NAME = coalesce(NAME, NAME_map)) %>% 
+    mutate(NAICS = ifelse(NAICS == "4541", "4541", "0")) %>%
+    select(GEO_ID, NAME, YEAR, NAICS, ESTAB, ESTAB_big, EMP) %>%
+    left_join(name_map, by = "GEO_ID", suffix = c("", "_map")) %>%
+    mutate(NAME = coalesce(NAME, NAME_map)) %>%
     select(-NAME_map)
 })
 
@@ -139,10 +162,17 @@ cbp <- cbp %>%
         TRUE ~ as.numeric(EMP)
       )
   )
-cbp <- cbp %>% 
-  group_by(GEO_ID, YEAR, NAICS) %>% 
-  summarise(ESTAB = sum(ESTAB), EMP = sum(EMP), .groups = "drop")
-cbp <- cbp %>% 
+cbp <- cbp %>%
+  group_by(GEO_ID, YEAR, NAICS) %>%
+  summarise(ESTAB = sum(ESTAB), ESTAB_big = sum(ESTAB_big), EMP = sum(EMP), .groups = "drop")
+
+# Global panel completion: every GEO_ID x every YEAR x {"4541","0"} must exist.
+# Counties absent from a given year's CBP raw file are filled with 0s.
+cbp <- cbp %>%
+  complete(GEO_ID, YEAR, NAICS = c("4541", "0"),
+           fill = list(ESTAB = 0, ESTAB_big = 0, EMP = 0))
+
+cbp <- cbp %>%
   mutate(EMP = ifelse(is.na(EMP), median(EMP, na.rm = TRUE), EMP))
 
 rm(cbp_list)
@@ -160,8 +190,54 @@ gdp <- raw_gdp %>%
   select(GeoFIPS,year,gdp) %>% 
   rename(GEO_ID = GeoFIPS, YEAR = year)
 
-# clean tax_full ----
+# clean payroll ----
 data(fips_codes)
+fips_lookup <- fips_codes %>%
+  mutate(GEO_ID = paste0(state_code, county_code)) %>%
+  select(GEO_ID, state_name, county)
+
+clean_payroll <- function(df) {
+  names(df) <- c("NAME", "NAICS", "NAICS_LABEL", "LFO_LABEL", "EMPSZES_LABEL",
+                 "YEAR", "ESTAB", "EMP", "PAYQTR1", "PAYANN")
+  df %>%
+    filter(as.character(NAICS) %in% c("00", "0"),
+           EMPSZES_LABEL == "All establishments",
+           grepl(",", NAME)) %>%
+    mutate(
+      PAYANN = as.numeric(gsub(",", "", PAYANN)),
+      YEAR   = as.integer(YEAR)
+    ) %>%
+    separate(NAME, into = c("county", "state"), sep = ", ",
+             fill = "right", extra = "merge") %>%
+    left_join(fips_lookup,
+              by = c("state" = "state_name", "county" = "county")) %>%
+    select(GEO_ID, YEAR, PAYANN)
+}
+
+payroll <- bind_rows(lapply(
+  list(raw_payroll_2015, raw_payroll_2016, raw_payroll_2017, raw_payroll_2018,
+       raw_payroll_2019, raw_payroll_2020, raw_payroll_2021, raw_payroll_2022),
+  clean_payroll
+)) %>%
+  filter(!is.na(GEO_ID))
+
+# Missing-data check
+n_geo_payroll <- length(unique(payroll$GEO_ID))
+cat("payroll: unique counties =", n_geo_payroll,
+    "| rows =", nrow(payroll),
+    "| NA payroll values =", sum(is.na(payroll$PAYANN)), "\n")
+cat("payroll: counties per year:\n")
+print(table(payroll$YEAR))
+
+# Compare with cbp county coverage
+n_geo_cbp <- length(unique(cbp$GEO_ID))
+cat("cbp panel counties =", n_geo_cbp,
+    "| missing from payroll =", n_geo_cbp - n_geo_payroll, "\n")
+
+# Persist payroll early in case downstream code OOMs
+write.csv(payroll, "data/temp/payroll_temp.csv", row.names = FALSE)
+
+# clean tax_full ----
 state_crosswalk <- fips_codes %>%
   distinct(state_name, state_code)
 
@@ -173,8 +249,6 @@ tax_full = raw_tax_full %>%
   mutate(year = sub("tax_", "", year)) %>% 
   drop_na()
   
-
-
 
 # clean state consumption + tax + wayfair timeline ----
 wayfair <- raw_wayfair %>% 
@@ -297,7 +371,10 @@ rm(cty_poly, cty_pt, pairs_idx, d_m, within_list)
 
 # construct county market access ----
 
-# note: ma does not include county's own gdp
+# note: ma does not include county's own mass (added later in estab.R)
+# Mass measure = annual payroll (PAYANN, $1,000). Column names retain the
+# "gdp_" prefix for backward compatibility with downstream code, but values
+# are payroll, not GDP.
 
 market = pairs %>%
   mutate(
@@ -306,8 +383,8 @@ market = pairs %>%
     same_state = (state_i == state_j)
   ) %>%
   left_join(
-    gdp %>%
-      pivot_wider(names_from = YEAR, values_from = gdp, names_prefix = "gdp_"),
+    payroll %>%
+      pivot_wider(names_from = YEAR, values_from = PAYANN, names_prefix = "gdp_"),
     by = c("GEOID_j" = "GEO_ID")
   ) %>%
   mutate(across(starts_with("gdp_"), as.numeric)) %>%
@@ -315,7 +392,7 @@ market = pairs %>%
     cols = starts_with("gdp_"),
     names_to = "year",
     values_to = "gdp_j"
-  ) %>% 
+  ) %>%
   mutate(year = as.numeric(sub("gdp_", "", year)))
 market = market %>% 
   left_join(tax_full %>% 
@@ -327,7 +404,7 @@ market = market %>%
     gdp_j = replace_na(gdp_j, 0),
     gdp_j_tax = gdp_j * tax,
     ma_contrib_new = gdp_j * dist_km_new,
-    ma_contrib = gdp_j / dist_km,
+    ma_contrib = gdp_j / (dist_km^1.5),
     ma_tax_contrib_new = ma_contrib_new * tax,
     ma_tax_contrib = ma_contrib * tax
   ) %>% 

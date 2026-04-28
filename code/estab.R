@@ -10,6 +10,7 @@ options(tigris_use_cache = TRUE)
     raw_pop <- read_xlsx("C:/document/SMU PhD/research/Data/Census Population Estimates Program/2010-2025 county pop.xlsx") 
     tax_raw <- read_xlsx("data/raw/combined sales tax.xlsx") 
     cit_raw <- read_xlsx("data/raw/us_state_corporate_tax.xlsx")
+    payroll_raw <- read.csv("data/temp/payroll_temp.csv", colClasses = c(GEO_ID = "character"))
     data("fips_codes")
 
 # clean state tax data ----
@@ -129,7 +130,7 @@ options(tigris_use_cache = TRUE)
         filter(STUSPS != STUSPS.1) %>%
         mutate(border_name = paste0(pmin(STUSPS, STUSPS.1), "-", pmax(STUSPS, STUSPS.1))) %>%
         group_by(border_name) %>%
-        summarize(geometry = st_union(geometry), .groups = "drop")
+        summarise(geometry = st_union(geometry), .groups = "drop")
 
     # Chordal distance: find nearest border point in geographic CRS,
     # then compute 3-D Euclidean distance through the Earth (chord length)
@@ -195,23 +196,24 @@ options(tigris_use_cache = TRUE)
     left_join(cty %>% select(GEOID, "state", is_boundary_county, STATEFP, coastal, border), by = c("GEO_ID" = "GEOID")) %>%
     left_join(pop_long, by = c("GEO_ID", "YEAR")) %>%
     filter(!STATEFP %in% exclude) %>% 
-    left_join(gdp, by = c("YEAR" = "YEAR", "GEO_ID" = "GEO_ID")) %>% 
-    left_join(market, by = c("YEAR" = "year", "GEO_ID" = "GEOID_i")) %>% 
+    left_join(gdp, by = c("YEAR" = "YEAR", "GEO_ID" = "GEO_ID")) %>%
+    left_join(payroll_raw, by = c("YEAR", "GEO_ID")) %>%
+    left_join(market, by = c("YEAR" = "year", "GEO_ID" = "GEOID_i")) %>%
     mutate(lest = asinh(ESTAB),
             gdp = as.numeric(gdp),
-            ma_in = ma_in + gdp,
-            ma_in_new = ma_in_new + gdp,
-            gdp_in = gdp + gdp_in,
+            PAYANN = as.numeric(PAYANN),
+            ma_in = ma_in + PAYANN,
+            ma_in_new = ma_in_new + PAYANN,
             lma_in = log(ma_in),
             lma_out = log(ma_out),
             lma = lma_in + lma_out,
             lma_in_expo = log(ma_in_new),
             lma_out_expo = log(ma_out_new),
             lemp = asinh(EMP),
-            lgdp_tax_in = asinh(gdp_tax_in),
-            lma_tax_in = asinh(ma_tax_in),
-            lma_tax_out = asinh(ma_tax_out),
-            lgdp_tax_out = asinh(gdp_tax_out)) %>% 
+            lestab_big = asinh(ESTAB_big),
+            lpayroll = log(PAYANN),
+            lma_tax_in = log(ma_tax_in),
+            lma_tax_out = log(ma_tax_out)) %>%
     left_join(raw_state %>% select(state, year, expo), by = c("state" = "state", "YEAR" = "year")) %>%
     left_join(tax %>% select(state, YEAR, sales_tax), by = c("state", "YEAR")) %>%
     left_join(cit %>% select(state, YEAR, cit, state_abbr), by = c("state", "YEAR")) %>%
@@ -264,7 +266,20 @@ options(tigris_use_cache = TRUE)
                 sales_tax > tax_other ~ 1L,
                 TRUE ~ -1L
             ),
-            dist_to_border_signed = dist_to_border * high_tax_side
+            dist_to_border_signed = dist_to_border * high_tax_side,
+            dist_to_border_edge_signed = dist_to_border_edge * high_tax_side,
+            high_tax_dummy = as.integer(high_tax_side == 1),
+            # Wayfair adoption year of the OPPOSITE state (what removes own residents' tax arbitrage)
+            adoption_year_other = case_when(
+                state_other %in% c("MA", "NY", "OH", "PA") ~ 2018L,
+                state_other %in% c("AZ", "AR", "NM", "OK", "RI", "TN", "TX", "VA") ~ 2020L,
+                state_other == "LA" ~ 2021L,
+                state_other %in% c("FL", "KS") ~ 2022L,
+                state_other == "MO" ~ 2023L,
+                is.na(state_other) ~ NA_integer_,
+                TRUE ~ 2019L
+            ),
+            post_wayfair = as.integer(YEAR >= adoption_year_other)
         )
 
 # border county pairs ----
@@ -287,14 +302,117 @@ options(tigris_use_cache = TRUE)
         filter(type == "online", pair_id %in% balanced_pair_ids)
 
 
+# pair balance test ----
+    # Within-pair balance on pre-Wayfair (YEAR < 2018) levels:
+    # for each pair × year, regress characteristic on high_tax_dummy with pair FE.
+    # Coef = high-tax-side mean minus low-tax-side mean within pair.
+    bal_data <- border_county_balanced %>%
+        filter(YEAR < 2018, !is.na(high_tax_dummy))
+
+    bal_vars <- c("gdp", "PAYANN", "pop", "ma_in", "ma_out",
+                  "lpayroll", "lma_in", "lma_out")
+
+    bal_models <- lapply(bal_vars, function(v) {
+        feols(
+            as.formula(paste0(v, " ~ high_tax_dummy | YEAR^pair_id")),
+            data    = bal_data,
+            cluster = ~ pair_id
+        )
+    })
+    names(bal_models) <- bal_vars
+
+    bal_table <- do.call(rbind, lapply(bal_vars, function(v) {
+        m   <- bal_models[[v]]
+        ct  <- summary(m)$coeftable["high_tax_dummy", ]
+        cf  <- as.numeric(ct["Estimate"])
+        se_ <- as.numeric(ct["Std. Error"])
+        pv  <- as.numeric(ct["Pr(>|t|)"])
+        ymean <- mean(bal_data[[v]], na.rm = TRUE)
+        data.frame(
+            variable    = v,
+            mean_y      = ymean,
+            diff_high   = cf,
+            se          = se_,
+            p_value     = pv,
+            pct_of_mean = 100 * cf / ymean,
+            n_obs       = m$nobs,
+            row.names   = NULL
+        )
+    }))
+    print(bal_table, row.names = FALSE)
+
+    etable(bal_models,
+           headers      = bal_vars,
+           tex          = TRUE,
+           style.tex    = style.tex(main = "aer", notes.tpt.intro = ""),
+           se.below     = TRUE,
+           fitstat      = c("n", "r2"),
+           digits       = 3,
+           file         = "output/pair_balance_test.tex",
+           replace      = TRUE,
+           title        = "Pair balance test: within-pair difference (high-tax minus low-tax), pre-Wayfair years (2015-2017)")
+
+
     # Pair-time FE panel regression
+    # post_wayfair = 1 from the year the OPPOSITE state adopted Wayfair (2019 default; FL/KS 2022, LA 2021, MO 2023)
     pair_reg <- feols(
-        lemp ~
-        lma + lma_tax_in + lma_tax_in * I(YEAR >= 2019) + lma_tax_out + lma_tax_out * I(YEAR >= 2019) + cit + pop | YEAR^pair_id + GEO_ID,
+        lesb ~
+        lma_in + lma_out + sales_tax + sales_tax:post_wayfair + cit + pop | YEAR^pair_id + GEO_ID,
         data = border_county_balanced %>% filter(type == "online"),
         cluster = ~STATEFP + nearest_border
     )
     summary(pair_reg)
+
+    etable(pair_reg,
+        tex = TRUE,
+        style.tex = style.tex(main = "aer", notes.tpt.intro = ""),
+        se.below = TRUE,
+        fitstat = c("n", "r2"),
+        digits = 3,
+        file = "output/pair_reg.tex"
+    )
+
+    # Dynamic event study: high_tax_dummy effect by event time (relative to opposite state's Wayfair)
+    border_county_balanced_dyn <- border_county_balanced %>%
+        filter(type == "online") %>%
+        mutate(
+            event_time = YEAR - adoption_year_other,
+            high_tax_gap = high_tax_dummy * tax_diff_abs
+        )
+
+    pair_event_intercept <- feols(
+        lemp ~ lma_in + lma_out + cit + pop +
+               i(event_time, high_tax_dummy, ref = -1) |
+               YEAR^pair_id + GEO_ID,
+        data = border_county_balanced_dyn,
+        cluster = ~STATEFP + nearest_border
+    )
+    summary(pair_event_intercept)
+
+    pair_event_gap <- feols(
+        lemp ~ lma_in + lma_out + cit + pop + high_tax_dummy +
+               i(event_time, high_tax_gap, ref = -1) |
+               YEAR^pair_id + GEO_ID,
+        data = border_county_balanced_dyn,
+        cluster = ~STATEFP + nearest_border
+    )
+    summary(pair_event_gap)
+
+    png("output/pair_event_intercept.png", width = 1000, height = 600, res = 150)
+    iplot(pair_event_intercept,
+          main = "Dynamic: high_tax_dummy (intercept shift)",
+          xlab = "Event time (years from opposite state's Wayfair)",
+          ylab = "Coefficient")
+    abline(v = -0.5, lty = 2, col = "red")
+    dev.off()
+
+    png("output/pair_event_gap.png", width = 1000, height = 600, res = 150)
+    iplot(pair_event_gap,
+          main = "Dynamic: high_tax_dummy x tax_diff_abs (gap scaling)",
+          xlab = "Event time (years from opposite state's Wayfair)",
+          ylab = "Coefficient")
+    abline(v = -0.5, lty = 2, col = "red")
+    dev.off()
 
     # Event study: lma_tax_out coefficient by year (ref = 2018)
     pair_event <- feols(
@@ -319,31 +437,38 @@ options(tigris_use_cache = TRUE)
 # Year-by-year OLS ----
     ols_by_year <- lapply(years, function(y) {
         feols(
-            lemp ~ lma_in + lma_out + cit + pop + coastal + border + dist_to_border_edge + I(dist_to_border_edge^2),
+            lemp ~ lma_in + lma_out + cit + pop + coastal + border +
+                   high_tax_dummy * (dist_to_border_edge + I(dist_to_border_edge^2) + I(dist_to_border_edge^3)+I(dist_to_border_edge^4)+I(dist_to_border_edge^5)),
             data = main %>% filter(type == "online", YEAR == y),
             cluster = ~STATEFP + nearest_border
         )
     })
     names(ols_by_year) <- years
-    # Coefficient plot across years
-    coef_names <- names(coef(ols_by_year[[1]]))
+
+    # I tried plotting the 5th polynomial curves: no crazy things are happening, basically a negative slope curve. 
+    # Only keep distance/dummy coefficients for plotting
+    all_coefs <- names(coef(ols_by_year[[1]]))
+    print(all_coefs)
+    drop_pattern <- "^(\\(Intercept\\)|lma_in|lma_out|cit|pop|coastal|border)$"
+    plot_coefs <- all_coefs[!grepl(drop_pattern, all_coefs)]
+
     coef_df <- do.call(rbind, lapply(years, function(y) {
         est <- ols_by_year[[as.character(y)]]
         data.frame(
             year  = y,
-            var   = coef_names,
-            coef  = as.numeric(coef(est)[coef_names]),
-            se    = as.numeric(se(est)[coef_names])
+            var   = plot_coefs,
+            coef  = as.numeric(coef(est)[plot_coefs]),
+            se    = as.numeric(se(est)[plot_coefs])
         )
     }))
     coef_df$ci_lo <- coef_df$coef - 1.96 * coef_df$se
     coef_df$ci_hi <- coef_df$coef + 1.96 * coef_df$se
 
-    n_coef <- length(coef_names)
+    n_coef <- length(plot_coefs)
     n_col  <- ceiling(n_coef / 2)
     png("output/ols_by_year.png", width = n_col * 400, height = 900, res = 150)
     par(mfrow = c(2, n_col), mar = c(4, 4, 2, 1))
-    for (v in coef_names) {
+    for (v in plot_coefs) {
         d <- coef_df[coef_df$var == v, ]
         plot(d$year, d$coef, type = "b", pch = 19,
              ylim = range(c(d$ci_lo, d$ci_hi)),
@@ -354,35 +479,7 @@ options(tigris_use_cache = TRUE)
     }
     dev.off()
 
-# Year-by-year OLS with restricted cubic splines ----
-    rcs_vars <- c("lemp", "lma_in", "lma_out", "cit", "pop", "coastal", "border", "dist_to_border_edge")
-    ols_rcs_by_year <- lapply(years, function(y) {
-        d <- main %>% filter(type == "online", YEAR == y) %>% st_drop_geometry() %>% select(all_of(rcs_vars)) %>% as.data.frame()
-        dd <- datadist(d)
-        options(datadist = "dd")
-        ols(lemp ~ lma_in + lma_out + cit + pop + coastal + border + rcs(dist_to_border_edge, 4),
-            data = d, x = TRUE, y = TRUE)
-    })
-    names(ols_rcs_by_year) <- years
 
-    # Plot spline effect of dist_to_border_edge by year
-    png("output/ols_rcs_by_year.png", width = 1600, height = 900, res = 150)
-    par(mfrow = c(2, 4), mar = c(4, 4, 3, 1))
-    for (y in years) {
-        d <- main %>% filter(type == "online", YEAR == y) %>% st_drop_geometry() %>% select(all_of(rcs_vars)) %>% as.data.frame()
-        dd <- datadist(d)
-        options(datadist = "dd")
-        p <- Predict(ols_rcs_by_year[[as.character(y)]], dist_to_border_edge)
-        plot(p$dist_to_border_edge, p$yhat, type = "l", lwd = 2,
-             ylim = range(c(p$lower, p$upper)),
-             main = as.character(y), xlab = "Distance to border (edge, km)", ylab = "Partial effect on lemp")
-        polygon(c(p$dist_to_border_edge, rev(p$dist_to_border_edge)),
-                c(p$lower, rev(p$upper)),
-                col = rgb(0, 0, 1, 0.15), border = NA)
-        lines(p$dist_to_border_edge, p$yhat, lwd = 2)
-        abline(h = 0, lty = 2, col = "red")
-    }
-    dev.off()
 
 # regression ----
     # PPML (Poisson PML) — dependent variable in levels (EMP), coefficients are semi-elasticities
