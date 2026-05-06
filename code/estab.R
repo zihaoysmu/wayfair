@@ -180,7 +180,7 @@ options(tigris_use_cache = TRUE)
     counties_sf$dist_to_border_edge <- R_earth * sqrt((ex2-ex1)^2 + (ey2-ey1)^2 + (ez2-ez1)^2)
 
     rm(coastline, countries, border_line, nb, neighbors, usa,
-       states_pre, state_border, county_cent, nearest_id,
+       states_pre, nearest_id,
        county_cent_geo, state_border_geo, nearest_pts_geo,
        coords_mat, from_lon, from_lat, to_lon, to_lat,
        x1, y1, z1, x2, y2, z2, R_earth,
@@ -355,21 +355,50 @@ options(tigris_use_cache = TRUE)
 
     # Pair-time FE panel regression
     # post_wayfair = 1 from the year the OPPOSITE state adopted Wayfair (2019 default; FL/KS 2022, LA 2021, MO 2023)
+    pair_reg_data <- border_county_balanced %>%
+        filter(type == "online") %>%
+        arrange(GEO_ID, YEAR) %>%
+        group_by(GEO_ID) %>%
+        mutate(
+            d_emp = EMP - lag(EMP),
+            d_lemp = lemp - lag(lemp)
+        ) %>%
+        ungroup() %>%
+        filter(!is.na(d_lemp))
+
     pair_reg <- feols(
-        lesb ~
-        lma_in + lma_out + sales_tax + sales_tax:post_wayfair + cit + pop | YEAR^pair_id + GEO_ID,
-        data = border_county_balanced %>% filter(type == "online"),
+        d_emp ~
+        lma_in + lma_out + sales_tax + sales_tax:post_wayfair + cit + pop | YEAR + pair_id + GEO_ID,
+        data = pair_reg_data,
         cluster = ~STATEFP + nearest_border
     )
     summary(pair_reg)
 
+    pair_reg_data %>%
+    summarise(
+        N = sum(!is.na(d_emp)),
+        mean = mean(d_emp, na.rm = TRUE),
+        sd = sd(d_emp, na.rm = TRUE),
+        min = min(d_emp, na.rm = TRUE),
+        p1 = quantile(d_emp, 0.01, na.rm = TRUE),
+        p5 = quantile(d_emp, 0.05, na.rm = TRUE),
+        p10 = quantile(d_emp, 0.10, na.rm = TRUE),
+        p25 = quantile(d_emp, 0.25, na.rm = TRUE),
+        median = median(d_emp, na.rm = TRUE),
+        p75 = quantile(d_emp, 0.75, na.rm = TRUE),
+        p90 = quantile(d_emp, 0.90, na.rm = TRUE),
+        p95 = quantile(d_emp, 0.95, na.rm = TRUE),
+        p99 = quantile(d_emp, 0.99, na.rm = TRUE),
+        max = max(d_emp, na.rm = TRUE)
+    )
+    dir.create("output/tables", recursive = TRUE, showWarnings = FALSE)
     etable(pair_reg,
         tex = TRUE,
         style.tex = style.tex(main = "aer", notes.tpt.intro = ""),
         se.below = TRUE,
         fitstat = c("n", "r2"),
         digits = 3,
-        file = "output/pair_reg.tex"
+        file = "output/tables/pair_reg.tex"
     )
 
     # Dynamic event study: high_tax_dummy effect by event time (relative to opposite state's Wayfair)
@@ -432,18 +461,102 @@ options(tigris_use_cache = TRUE)
     )
     abline(v = 2018.5, lty = 2, col = "red")
 
-
-
 # Year-by-year OLS ----
+    poly_degree <- 2
+    dist_var <- "dist_to_border_edge"
+    dist_poly_terms <- c(
+        dist_var,
+        paste0("I(", dist_var, "^", 2:poly_degree, ")")
+    )
+    interaction_terms <- paste0("high_tax_dummy:", dist_poly_terms)
+    normalize_term <- function(x) {
+        strip_I <- function(term) {
+            while (grepl("^I\\(.*\\)$", term)) {
+                term <- sub("^I\\((.*)\\)$", "\\1", term)
+            }
+            term
+        }
+
+        x <- gsub("[`[:space:]]", "", x)
+        vapply(strsplit(x, ":", fixed = TRUE), function(parts) {
+            parts <- vapply(parts, strip_I, character(1))
+            if (length(parts) > 1) {
+                paste(sort(parts), collapse = ":")
+            } else {
+                parts
+            }
+        }, character(1))
+    }
+    match_terms <- function(coef_names, expected_terms) {
+        idx <- match(normalize_term(expected_terms), normalize_term(coef_names))
+        if (any(is.na(idx))) {
+            stop(
+                "Cannot match model terms. Expected: ",
+                paste(expected_terms, collapse = ", "),
+                ". Actual coefficient names: ",
+                paste(coef_names, collapse = ", ")
+            )
+        }
+        coef_names[idx]
+    }
+    marginal_effect_group <- function(est, dist_grid, group_value) {
+        coef_names <- names(coef(est))
+        dist_terms <- match_terms(coef_names, dist_poly_terms)
+        interaction_terms_matched <- match_terms(coef_names, interaction_terms)
+
+        main_grad <- sapply(seq_along(dist_terms), function(p) {
+            p * dist_grid^(p - 1)
+        })
+        if (!is.matrix(main_grad)) main_grad <- matrix(main_grad, ncol = 1)
+
+        grad <- cbind(main_grad, group_value * main_grad)
+        term_names <- c(dist_terms, interaction_terms_matched)
+        b <- coef(est)[term_names]
+        V <- vcov(est)[term_names, term_names, drop = FALSE]
+        me <- as.vector(grad %*% b)
+        se <- sqrt(pmax(diag(grad %*% V %*% t(grad)), 0))
+
+        data.frame(
+            distance = dist_grid,
+            high_tax_dummy = group_value,
+            tax_side = ifelse(group_value == 1, "High-tax side", "Low-tax side"),
+            marginal_effect = me,
+            ci_lo = me - 1.96 * se,
+            ci_hi = me + 1.96 * se
+        )
+    }
+    ols_formula <- as.formula(
+        paste(
+            "lemp ~ lma_in + lma_out + cit + pop + coastal + border + high_tax_dummy +",
+            paste(c(dist_poly_terms, interaction_terms), collapse = " + ")
+        )
+    )
+
     ols_by_year <- lapply(years, function(y) {
         feols(
-            lemp ~ lma_in + lma_out + cit + pop + coastal + border +
-                   high_tax_dummy * (dist_to_border_edge + I(dist_to_border_edge^2) + I(dist_to_border_edge^3)+I(dist_to_border_edge^4)+I(dist_to_border_edge^5)),
+            ols_formula,
             data = main %>% filter(type == "online", YEAR == y),
             cluster = ~STATEFP + nearest_border
         )
     })
     names(ols_by_year) <- years
+    do.call(
+        etable,
+        c(
+            ols_by_year,
+            list(
+                headers = paste("Year", years),
+                tex = TRUE,
+                style.tex = style.tex(main = "aer", notes.tpt.intro = ""),
+                se.below = TRUE,
+                fitstat = c("n", "r2"),
+                digits = 3,
+                file = "output/ols_by_year.tex",
+                replace = TRUE,
+                title = "Year-by-year OLS: online employment on distance polynomial and high-tax-side interactions"
+            )
+        )
+    )
 
     # I tried plotting the 5th polynomial curves: no crazy things are happening, basically a negative slope curve. 
     # Only keep distance/dummy coefficients for plotting
@@ -479,7 +592,45 @@ options(tigris_use_cache = TRUE)
     }
     dev.off()
 
+    # Marginal effect of distance:
+    # with a K-th order raw polynomial,
+    # dE[lemp]/d distance = beta_1 + 2 * beta_2 * d + ... + K * beta_K * d^(K-1).
+    # Standard errors use the delta method with the clustered vcov matrix.
+    dist_grid <- seq(
+        quantile(main[[dist_var]][main$type == "online"], 0.01, na.rm = TRUE),
+        quantile(main[[dist_var]][main$type == "online"], 0.99, na.rm = TRUE),
+        length.out = 200
+    )
+    me_df <- bind_rows(lapply(years, function(y) {
+        est <- ols_by_year[[as.character(y)]]
+        bind_rows(
+            marginal_effect_group(est, dist_grid, 0),
+            marginal_effect_group(est, dist_grid, 1)
+        ) %>%
+            mutate(year = y)
+    }))
 
+    me_plot <- ggplot(me_df, aes(x = distance, y = marginal_effect,
+                                 color = tax_side, fill = tax_side)) +
+        geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), alpha = 0.2, color = NA) +
+        geom_line(size = 0.8) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+        facet_wrap(~ year, ncol = 4,
+                   labeller = labeller(year = function(x) paste("Year", x))) +
+        scale_color_manual(values = c("Low-tax side" = "steelblue", "High-tax side" = "darkorange")) +
+        scale_fill_manual(values = c("Low-tax side" = "steelblue", "High-tax side" = "darkorange")) +
+        labs(
+            title = "Marginal Effect of Distance to State Border",
+            subtitle = "Online sector by tax side",
+            x = "Distance to border edge (km)",
+            y = "Marginal effect on lemp",
+            color = NULL,
+            fill = NULL
+        ) +
+        theme_minimal()
+
+    ggplot2::ggsave("output/marginal_effect_by_year.png", me_plot,
+                    width = 12, height = 8, dpi = 150)
 
 # regression ----
     # PPML (Poisson PML) — dependent variable in levels (EMP), coefficients are semi-elasticities
