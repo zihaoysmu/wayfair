@@ -62,7 +62,7 @@ options(tigris_use_cache = TRUE)
         select(GEOID, STATEFP, NAME)
     # 2)建立邻接关系（touches:共享边或点）
     nb <- st_touches(cty)  # list: 每个county的邻居index
-    # 3)判断是否存在“跨州邻居”
+    # 3)判断是否存在“跨州邻居�?
     boundary <- vapply(seq_len(nrow(cty)), function(i) {
         nbr <- nb[[i]]
         if (length(nbr) == 0) return(FALSE)
@@ -199,7 +199,7 @@ options(tigris_use_cache = TRUE)
     left_join(gdp, by = c("YEAR" = "YEAR", "GEO_ID" = "GEO_ID")) %>%
     left_join(payroll_raw, by = c("YEAR", "GEO_ID")) %>%
     left_join(market, by = c("YEAR" = "year", "GEO_ID" = "GEOID_i")) %>%
-    mutate(lest = asinh(ESTAB),
+    mutate(asinh_estab = asinh(ESTAB),
             gdp = as.numeric(gdp),
             PAYANN = as.numeric(PAYANN),
             ma_in = ma_in + PAYANN,
@@ -209,8 +209,8 @@ options(tigris_use_cache = TRUE)
             lma = lma_in + lma_out,
             lma_in_expo = log(ma_in_new),
             lma_out_expo = log(ma_out_new),
-            lemp = asinh(EMP),
-            lestab_big = asinh(ESTAB_big),
+            asinh_emp = asinh(EMP),
+            asinh_estab_big = asinh(ESTAB_big),
             lpayroll = log(PAYANN),
             lma_tax_in = log(ma_tax_in),
             lma_tax_out = log(ma_tax_out)) %>%
@@ -361,10 +361,10 @@ options(tigris_use_cache = TRUE)
         group_by(GEO_ID) %>%
         mutate(
             d_emp = EMP - lag(EMP),
-            d_lemp = lemp - lag(lemp)
+            d_asinh_emp = asinh_emp - lag(asinh_emp)
         ) %>%
         ungroup() %>%
-        filter(!is.na(d_lemp))
+        filter(!is.na(d_asinh_emp))
 
     pair_reg <- feols(
         d_emp ~
@@ -392,6 +392,7 @@ options(tigris_use_cache = TRUE)
         max = max(d_emp, na.rm = TRUE)
     )
     dir.create("output/tables", recursive = TRUE, showWarnings = FALSE)
+    dir.create("output/figures", recursive = TRUE, showWarnings = FALSE)
     etable(pair_reg,
         tex = TRUE,
         style.tex = style.tex(main = "aer", notes.tpt.intro = ""),
@@ -410,7 +411,7 @@ options(tigris_use_cache = TRUE)
         )
 
     pair_event_intercept <- feols(
-        lemp ~ lma_in + lma_out + cit + pop +
+        asinh_emp ~ lma_in + lma_out + cit + pop +
                i(event_time, high_tax_dummy, ref = -1) |
                YEAR^pair_id + GEO_ID,
         data = border_county_balanced_dyn,
@@ -419,7 +420,7 @@ options(tigris_use_cache = TRUE)
     summary(pair_event_intercept)
 
     pair_event_gap <- feols(
-        lemp ~ lma_in + lma_out + cit + pop + high_tax_dummy +
+        asinh_emp ~ lma_in + lma_out + cit + pop + high_tax_dummy +
                i(event_time, high_tax_gap, ref = -1) |
                YEAR^pair_id + GEO_ID,
         data = border_county_balanced_dyn,
@@ -445,7 +446,7 @@ options(tigris_use_cache = TRUE)
 
     # Event study: lma_tax_out coefficient by year (ref = 2018)
     pair_event <- feols(
-        lemp ~
+        asinh_emp ~
         lma + lma_tax_in + lma_tax_in * I(YEAR >= 2019) +
         i(YEAR, lma_tax_out, ref = 2018) +
         cit + pop | YEAR^pair_id + GEO_ID,
@@ -461,6 +462,227 @@ options(tigris_use_cache = TRUE)
     )
     abline(v = 2018.5, lty = 2, col = "red")
 
+# Neighbor county year-by-year 2x2 models ----
+    dir.create("output/tables", recursive = TRUE, showWarnings = FALSE)
+    dir.create("output/figures", recursive = TRUE, showWarnings = FALSE)
+
+    neighbor_county_changes <- border_county_balanced %>%
+        filter(type == "online") %>%
+        distinct(GEO_ID, YEAR, ESTAB, EMP) %>%
+        mutate(
+            ESTAB = as.numeric(ESTAB),
+            EMP = as.numeric(EMP)
+        ) %>%
+        arrange(GEO_ID, YEAR) %>%
+        group_by(GEO_ID) %>%
+        mutate(
+            d_estab = ESTAB - lag(ESTAB),
+            d_emp = EMP - lag(EMP)
+        ) %>%
+        ungroup() %>%
+        select(GEO_ID, YEAR, d_estab, d_emp)
+
+    neighbor_county_year_data <- border_county_balanced %>%
+        filter(type == "online") %>%
+        mutate(
+            ESTAB = as.numeric(ESTAB),
+            EMP = as.numeric(EMP)
+        ) %>%
+        left_join(neighbor_county_changes, by = c("GEO_ID", "YEAR"))
+
+    neighbor_county_outcomes <- tibble(
+        outcome_family = c("Establishments", "Establishments", "Employment", "Employment"),
+        outcome = c("d_estab", "ESTAB", "d_emp", "EMP"),
+        outcome_label = c(
+            "Change in establishments",
+            "Establishments (PPML proportional effect)",
+            "Change in employment",
+            "Employment (PPML proportional effect)"
+        ),
+        model_type = c("OLS", "PPML", "OLS", "PPML")
+    )
+
+    neighbor_county_treatments <- tibble(
+        treatment = c("high_tax_dummy", "sales_tax"),
+        treatment_label = c("High-tax dummy", "Sales tax rate (1 pp)"),
+        treatment_effect_unit = c(1, 0.01)
+    )
+
+    neighbor_county_fe_specs <- tibble(
+        pair_fe = c(FALSE, TRUE),
+        fe_label = c("No pair FE", "Pair FE")
+    )
+
+    run_neighbor_county_year_model <- function(outcome_family,
+                                               outcome_var,
+                                               outcome_label,
+                                               model_type,
+                                               treatment_var,
+                                               treatment_label,
+                                               treatment_effect_unit,
+                                               pair_fe,
+                                               fe_label,
+                                               yr) {
+        model_data <- neighbor_county_year_data %>%
+            filter(YEAR == yr) %>%
+            filter(
+                !is.na(.data[[outcome_var]]),
+                !is.na(.data[[treatment_var]]),
+                !is.na(pop),
+                !is.na(cit),
+                !is.na(lma_in),
+                !is.na(lma_out),
+                !is.na(border),
+                !is.na(coastal)
+            )
+
+        if (pair_fe) {
+            model_data <- model_data %>% filter(!is.na(pair_id))
+        }
+
+        if (nrow(model_data) == 0) return(NULL)
+
+        rhs <- paste(
+            c(treatment_var, "pop", "cit", "lma_in", "lma_out", "border", "coastal"),
+            collapse = " + "
+        )
+        model_formula <- as.formula(paste0(
+            outcome_var, " ~ ", rhs,
+            if (pair_fe) " | pair_id" else ""
+        ))
+
+        fit <- tryCatch({
+            if (model_type == "PPML") {
+                fepois(
+                    model_formula,
+                    data = model_data,
+                    cluster = ~STATEFP + nearest_border
+                )
+            } else {
+                feols(
+                    model_formula,
+                    data = model_data,
+                    cluster = ~STATEFP + nearest_border
+                )
+            }
+        }, error = function(e) NULL)
+
+        if (is.null(fit)) return(NULL)
+
+        coef_names <- names(coef(fit))
+        if (!treatment_var %in% coef_names) return(NULL)
+
+        crit <- qnorm(0.975)
+
+        if (model_type == "PPML") {
+            b <- as.numeric(coef(fit)[treatment_var])
+            v <- vcov(fit)
+            se_b <- as.numeric(sqrt(v[treatment_var, treatment_var]))
+
+            estimate <- exp(treatment_effect_unit * b) - 1
+            estimate_se <- treatment_effect_unit * exp(treatment_effect_unit * b) * se_b
+            ci_l <- exp(treatment_effect_unit * (b - crit * se_b)) - 1
+            ci_r <- exp(treatment_effect_unit * (b + crit * se_b)) - 1
+            estimand <- "proportional_effect"
+        } else {
+            estimate <- treatment_effect_unit * as.numeric(coef(fit)[treatment_var])
+            estimate_se <- treatment_effect_unit * as.numeric(se(fit)[treatment_var])
+            ci_l <- estimate - crit * estimate_se
+            ci_r <- estimate + crit * estimate_se
+            estimand <- "coefficient"
+        }
+
+        tibble(
+            outcome_family = outcome_family,
+            outcome = outcome_var,
+            outcome_label = outcome_label,
+            model_type = model_type,
+            treatment = treatment_var,
+            treatment_label = treatment_label,
+            treatment_effect_unit = treatment_effect_unit,
+            pair_fe = pair_fe,
+            fe_label = fe_label,
+            estimand = estimand,
+            year = yr,
+            estimate = estimate,
+            se = estimate_se,
+            ci_l = ci_l,
+            ci_r = ci_r,
+            n_obs = fit$nobs
+        )
+    }
+
+    neighbor_county_year_models <- bind_rows(lapply(seq_len(nrow(neighbor_county_outcomes)), function(i) {
+        bind_rows(lapply(seq_len(nrow(neighbor_county_treatments)), function(j) {
+            bind_rows(lapply(seq_len(nrow(neighbor_county_fe_specs)), function(k) {
+                bind_rows(lapply(years, function(y) {
+                    run_neighbor_county_year_model(
+                        outcome_family = neighbor_county_outcomes$outcome_family[i],
+                        outcome_var = neighbor_county_outcomes$outcome[i],
+                        outcome_label = neighbor_county_outcomes$outcome_label[i],
+                        model_type = neighbor_county_outcomes$model_type[i],
+                        treatment_var = neighbor_county_treatments$treatment[j],
+                        treatment_label = neighbor_county_treatments$treatment_label[j],
+                        treatment_effect_unit = neighbor_county_treatments$treatment_effect_unit[j],
+                        pair_fe = neighbor_county_fe_specs$pair_fe[k],
+                        fe_label = neighbor_county_fe_specs$fe_label[k],
+                        yr = y
+                    )
+                }))
+            }))
+        }))
+    })) %>%
+        mutate(
+            outcome_family = factor(outcome_family, levels = c("Establishments", "Employment")),
+            treatment_label = factor(treatment_label, levels = neighbor_county_treatments$treatment_label),
+            fe_label = factor(fe_label, levels = neighbor_county_fe_specs$fe_label)
+        ) %>%
+        arrange(outcome_family, treatment, pair_fe, outcome, model_type, year)
+
+    write_csv(
+        neighbor_county_year_models,
+        "output/tables/neighbor_county_year_by_year_2x2.csv"
+    )
+
+    plot_neighbor_county_year_2x2 <- function(plot_data, family_label, output_file) {
+        p <- plot_data %>%
+            filter(outcome_family == family_label) %>%
+            ggplot(aes(x = year, y = estimate, color = outcome_label, group = outcome_label)) +
+            geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+            geom_errorbar(aes(ymin = ci_l, ymax = ci_r), width = 0.2, linewidth = 0.55) +
+            geom_line(linewidth = 0.75) +
+            geom_point(size = 2.1) +
+            facet_grid(treatment_label ~ fe_label, scales = "free_y") +
+            scale_x_continuous(breaks = years) +
+            labs(
+                title = paste0("Neighbor County Year-by-Year ", family_label, " Models"),
+                subtitle = "Rows: treatment variable; columns: pair fixed effects. Sales tax effects are for a 1 percentage point increase.",
+                x = "Year",
+                y = "Estimate",
+                color = NULL
+            ) +
+            theme_bw() +
+            theme(
+                legend.position = "bottom",
+                strip.background = element_rect(fill = "grey90", color = "grey60")
+            )
+
+        ggsave(output_file, p, width = 11, height = 8, dpi = 150)
+        print(p)
+        invisible(p)
+    }
+
+    neighbor_county_estab_2x2_plot <- plot_neighbor_county_year_2x2(
+        neighbor_county_year_models,
+        "Establishments",
+        "output/figures/neighbor_county_establishment_year_by_year_2x2.png"
+    )
+
+    neighbor_county_emp_2x2_plot <- plot_neighbor_county_year_2x2(
+        neighbor_county_year_models,
+        "Employment",
+        "output/figures/neighbor_county_employment_year_by_year_2x2.png"
+    )
 # Year-by-year OLS ----
     poly_degree <- 2
     dist_var <- "dist_to_border_edge"
@@ -527,7 +749,7 @@ options(tigris_use_cache = TRUE)
     }
     ols_formula <- as.formula(
         paste(
-            "lemp ~ lma_in + lma_out + cit + pop + coastal + border + high_tax_dummy +",
+            "asinh_emp ~ lma_in + lma_out + cit + pop + coastal + border + high_tax_dummy +",
             paste(c(dist_poly_terms, interaction_terms), collapse = " + ")
         )
     )
@@ -594,7 +816,7 @@ options(tigris_use_cache = TRUE)
 
     # Marginal effect of distance:
     # with a K-th order raw polynomial,
-    # dE[lemp]/d distance = beta_1 + 2 * beta_2 * d + ... + K * beta_K * d^(K-1).
+    # dE[asinh_emp]/d distance = beta_1 + 2 * beta_2 * d + ... + K * beta_K * d^(K-1).
     # Standard errors use the delta method with the clustered vcov matrix.
     dist_grid <- seq(
         quantile(main[[dist_var]][main$type == "online"], 0.01, na.rm = TRUE),
@@ -623,7 +845,7 @@ options(tigris_use_cache = TRUE)
             title = "Marginal Effect of Distance to State Border",
             subtitle = "Online sector by tax side",
             x = "Distance to border edge (km)",
-            y = "Marginal effect on lemp",
+            y = "Marginal effect on asinh_emp",
             color = NULL,
             fill = NULL
         ) +
@@ -633,7 +855,7 @@ options(tigris_use_cache = TRUE)
                     width = 12, height = 8, dpi = 150)
 
 # regression ----
-    # PPML (Poisson PML) — dependent variable in levels (EMP), coefficients are semi-elasticities
+    # PPML (Poisson PML) �?dependent variable in levels (EMP), coefficients are semi-elasticities
     reg <- fepois(
         EMP ~
         lma_in + lma_out + lma_tax_in + lma_tax_in * I(YEAR >= 2019) + lma_tax_out + lma_tax_out * I(YEAR >= 2019) + cit + pop | YEAR + GEO_ID,
@@ -676,7 +898,7 @@ options(tigris_use_cache = TRUE)
 
             group_data <- main %>%
                 filter(YEAR %in% group_years, type == "online") %>%
-                select(GEO_ID, YEAR, STATEFP, lemp, dist_to_border_signed,
+                select(GEO_ID, YEAR, STATEFP, asinh_emp, dist_to_border_signed,
                     lma_in, lma_out, cit, EMP, nearest_border, pop) %>%
                 drop_na()
 
@@ -701,7 +923,7 @@ options(tigris_use_cache = TRUE)
 
             lapply(bandwidths, function(bw) {
                 reg_rdd <- rdrobust(
-                    y = group_data$lemp,
+                    y = group_data$asinh_emp,
                     x = group_data$dist_to_border_signed,
                     covs = covs_mat,
                     cluster = group_data$GEO_ID,
@@ -749,7 +971,7 @@ options(tigris_use_cache = TRUE)
 
             # heterogeneous effect by tax difference
             grembi_rdd <- feols(
-            lemp ~ dist_to_border_signed + S + S:dist_to_border_signed +
+            asinh_emp ~ dist_to_border_signed + S + S:dist_to_border_signed +
                 Tt + Tt:dist_to_border_signed +
                 S:Tt + S:Tt:dist_to_border_signed +
                 # heterogeneity terms: full interactions
@@ -776,22 +998,22 @@ options(tigris_use_cache = TRUE)
                 file = "output/grembi_rdd_heter.tex"
             )
 
-        # Dynamic (event study) Grembi approach — mirrors grembi_rdd spec year-by-year
+        # Dynamic (event study) Grembi approach �?mirrors grembi_rdd spec year-by-year
             # Each Tt × ... term is replaced with i(YEAR_f, ..., ref = "2018")
             # Static terms (no Tt): dist_to_border_signed, S, S:dist_to_border_signed, S:tax_diff_abs
             grembi_event <- grembi_20000 %>%
                 mutate(
                     YEAR_f      = factor(YEAR),
-                    S_slope     = S * dist_to_border_signed,          # Tt:S:dist  → i(YEAR_f, S_slope)
-                    dist_tax    = dist_to_border_signed * tax_diff_abs, # Tt:dist:tax_diff → i(YEAR_f, dist_tax)
-                    S_slope_tax = S * dist_to_border_signed * tax_diff_abs  # Tt:S:dist:tax_diff → i(YEAR_f, S_slope_tax)
+                    S_slope     = S * dist_to_border_signed,          # Tt:S:dist  �?i(YEAR_f, S_slope)
+                    dist_tax    = dist_to_border_signed * tax_diff_abs, # Tt:dist:tax_diff �?i(YEAR_f, dist_tax)
+                    S_slope_tax = S * dist_to_border_signed * tax_diff_abs  # Tt:S:dist:tax_diff �?i(YEAR_f, S_slope_tax)
                 )
 
             grembi_event_rdd <- feols(
-                lemp ~ dist_to_border_signed + S + S:dist_to_border_signed +
+                asinh_emp ~ dist_to_border_signed + S + S:dist_to_border_signed +
                     S:tax_diff_abs +                                        # static: S × tax_diff (no Tt)
                     i(YEAR_f, dist_to_border_signed, ref = "2018") +       # Tt:dist
-                    i(YEAR_f, S,           ref = "2018") +                 # S:Tt ← key dynamic effect
+                    i(YEAR_f, S,           ref = "2018") +                 # S:Tt �?key dynamic effect
                     i(YEAR_f, S_slope,     ref = "2018") +                 # S:Tt:dist
                     i(YEAR_f, tax_diff_abs, ref = "2018") +                # Tt:tax_diff
                     i(YEAR_f, dist_tax,    ref = "2018") +                 # Tt:dist:tax_diff
@@ -833,7 +1055,7 @@ options(tigris_use_cache = TRUE)
             filter(YEAR %in% c(2017, 2019)) %>%
             group_by(GEO_ID) %>%
             arrange(YEAR) %>%
-            mutate(d_lemp = lemp - lag(lemp),
+            mutate(d_asinh_emp = asinh_emp - lag(asinh_emp),
                    d_dist = dist_to_border_signed - lag(dist_to_border_signed),
                    d_lma_in = lma_in - lag(lma_in),
                    d_lma_out = lma_out - lag(lma_out),
@@ -844,7 +1066,7 @@ options(tigris_use_cache = TRUE)
             drop_na()
 
         butt_rdd <- rdrobust(
-            y = butt$d_lemp,
+            y = butt$d_asinh_emp,
             x = butt$dist_to_border_signed,
             covs = cbind(butt$d_lma_in, butt$d_lma_out, butt$d_cit, butt$d_pop, butt$d_tax_diff_abs),
             cluster = butt$GEO_ID,
@@ -877,7 +1099,7 @@ options(tigris_use_cache = TRUE)
 
         # --- expo MA spec (test) ---
         # Grembi et al. 2016 approach with exponential market access
-        grembi_expo_rdd <- feols(lemp ~ dist_to_border_signed + S + S:dist_to_border_signed + Tt + Tt:dist_to_border_signed + S:Tt + S:Tt:dist_to_border_signed
+        grembi_expo_rdd <- feols(asinh_emp ~ dist_to_border_signed + S + S:dist_to_border_signed + Tt + Tt:dist_to_border_signed + S:Tt + S:Tt:dist_to_border_signed
         + lma_in_expo + lma_out_expo + cit + pop | YEAR + nearest_border,
                 data = grembi_50000,
                 cluster = ~GEO_ID)
@@ -901,7 +1123,7 @@ options(tigris_use_cache = TRUE)
             filter(YEAR %in% c(2017, 2019)) %>%
             group_by(GEO_ID) %>%
             arrange(YEAR) %>%
-            mutate(d_lemp = lemp - lag(lemp),
+            mutate(d_asinh_emp = asinh_emp - lag(asinh_emp),
                    d_lma_in_expo = lma_in_expo - lag(lma_in_expo),
                    d_lma_out_expo = lma_out_expo - lag(lma_out_expo),
                    d_cit = cit - lag(cit),
@@ -910,7 +1132,7 @@ options(tigris_use_cache = TRUE)
             drop_na()
 
         butt_expo_rdd <- rdrobust(
-            y = butt_expo$d_lemp,
+            y = butt_expo$d_asinh_emp,
             x = butt_expo$dist_to_border_signed,
             covs = cbind(butt_expo$d_lma_in_expo, butt_expo$d_lma_out_expo, butt_expo$d_cit, butt_expo$d_pop),
             cluster = butt_expo$GEO_ID,
@@ -934,14 +1156,14 @@ options(tigris_use_cache = TRUE)
 
     # nearest_border[dist_to_border_signed] = pair-specific slope on distance (f_p(R))
     cont_rdd_20 <- feols(
-        lemp ~ tax_diff_abs + lma_in + lma_out + cit + pop + tax_diff_abs:dist_to_border_signed |
+        asinh_emp ~ tax_diff_abs + lma_in + lma_out + cit + pop + tax_diff_abs:dist_to_border_signed |
             YEAR + nearest_border[dist_to_border_signed],
         data = cont_20,
         cluster = ~GEO_ID
     )
 
     cont_rdd_50 <- feols(
-        lemp ~ tax_diff_abs + lma_in + lma_out + cit + pop + tax_diff_abs:dist_to_border_signed |
+        asinh_emp ~ tax_diff_abs + lma_in + lma_out + cit + pop + tax_diff_abs:dist_to_border_signed |
             YEAR + nearest_border[dist_to_border_signed],
         data = cont_50,
         cluster = ~GEO_ID
@@ -963,17 +1185,17 @@ options(tigris_use_cache = TRUE)
 
 # Cross-sectional RDD by year ----
 #   Three bandwidth specifications are compared:
-#   1) Fixed 20 km  — tight window, less bias but more variance
-#   2) Fixed 50 km  — wider window, more power but higher bias risk
-#   3) Automatic     — MSE-optimal bandwidth chosen by rdrobust (Calonico et al.)
+#   1) Fixed 20 km  �?tight window, less bias but more variance
+#   2) Fixed 50 km  �?wider window, more power but higher bias risk
+#   3) Automatic     �?MSE-optimal bandwidth chosen by rdrobust (Calonico et al.)
 # Each plot shows the discontinuity estimate with 90% CI across years.
 
 # Helper: run cross-sectional RDD for one year
-# bw_km = numeric → fixed bandwidth; bw_km = NULL → let rdrobust pick optimal
+# bw_km = numeric �?fixed bandwidth; bw_km = NULL �?let rdrobust pick optimal
 run_rdd_year <- function(yr, bw_km = NULL) {
     yr_data <- main %>%
         filter(YEAR == yr, type == "online") %>%
-        select(GEO_ID, YEAR, STATEFP, lemp, dist_to_border_signed,
+        select(GEO_ID, YEAR, STATEFP, asinh_emp, dist_to_border_signed,
                lma_in, lma_out, cit, nearest_border, pop) %>%
         drop_na()
 
@@ -1001,7 +1223,7 @@ run_rdd_year <- function(yr, bw_km = NULL) {
 
     # Build rdrobust arguments; omit h/b when bw_km is NULL (auto selection)
     rdd_args <- list(
-        y          = yr_data$lemp,
+        y          = yr_data$asinh_emp,
         x          = yr_data$dist_to_border_signed,
         covs       = covs_mat,
         cluster    = yr_data$nearest_border,
@@ -1067,5 +1289,6 @@ p_rdd_auto  <- plot_rdd_by_year(rdd_auto_df, "optimal bw")
 ggsave("output/rdd_by_year_optimal.pdf", p_rdd_auto, width = 8, height = 5)
 print(p_rdd_auto)
 print(rdd_auto_df %>% select(year, bw_h))
+
 
 

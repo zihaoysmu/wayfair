@@ -9,7 +9,7 @@ library(data.table)
 library(units)
 
 # Build balanced ZIP-year-wedge and wedge-year panels from Census API outputs.
-# Spatial design: 10-mile state-border buffer + 20-mile grid wedges.
+# Spatial design: configurable state-border buffer + 20-mile grid wedges.
 options(tigris_use_cache = TRUE)
 dir.create("data/temp", recursive = TRUE, showWarnings = FALSE)
 dir.create("data/temp/tigris_cache", recursive = TRUE, showWarnings = FALSE)
@@ -22,8 +22,26 @@ years <- 2015:2022
 crs_projected <- 5070
 mile_to_meter <- 1609.344
 grid_size_m <- 20 * mile_to_meter
-buffer_m <- 10 * mile_to_meter
+buffer_miles <- as.numeric(Sys.getenv("WEDGE_BUFFER_MILES", "10"))
+buffer_m <- buffer_miles * mile_to_meter
 market_radius_km <- 1000
+
+format_buffer_suffix <- function(x) {
+  label <- format(x, trim = TRUE, scientific = FALSE)
+  label <- sub("(\\.\\d*?)0+$", "\\1", label)
+  label <- sub("\\.$", "", label)
+  paste0(str_replace(label, "\\.", "p"), "mile")
+}
+
+buffer_suffix <- format_buffer_suffix(buffer_miles)
+
+temp_csv_path <- function(stem, legacy_stem = stem) {
+  if (identical(buffer_suffix, "10mile")) {
+    file.path("data/temp", paste0(legacy_stem, ".csv"))
+  } else {
+    file.path("data/temp", paste0(stem, "_", buffer_suffix, ".csv"))
+  }
+}
 
 # Standardize Census/API column names before joins.
 clean_names <- function(df) {
@@ -282,6 +300,7 @@ compute_market_potential <- function(focal_points,
 
 # 1. Load lower-48 + DC states and ZCTA polygons.
 message("Loading state and ZCTA geometries...")
+message("Using ", buffer_miles, "-mile state-border buffer.")
 lower48_dc <- c(setdiff(state.abb, c("AK", "HI")), "DC")
 
 states_sf <- states(cb = TRUE, year = 2022) |>
@@ -378,7 +397,7 @@ if (anyDuplicated(zcta_wedge_crosswalk$zipcode) > 0) {
 
 write_csv(
   zcta_wedge_crosswalk,
-  "data/temp/zcta_wedge_crosswalk_10mile.csv"
+  temp_csv_path("zcta_wedge_crosswalk", "zcta_wedge_crosswalk_10mile")
 )
 
 # 4. Build wedge ZIP clusters and diagnostics for the spatial sample.
@@ -404,11 +423,13 @@ wedge_pair_sides <- zcta_wedge_crosswalk |>
   count(wedge_pair_id, name = "n_sides")
 
 border_wedge_diagnostics <- tibble(
+  buffer_miles = buffer_miles,
+  buffer_distance_m = buffer_m,
   number_of_state_pairs = nrow(state_pair_borders),
   number_of_grid_cells_intersecting_borders = nrow(border_grid),
   number_of_wedges = nrow(wedges_sf),
   number_of_wedge_pairs = n_distinct(wedges_sf$wedge_pair_id),
-  number_of_zctas_in_10mile_sample = nrow(zcta_near_border),
+  number_of_zctas_in_buffer_sample = nrow(zcta_near_border),
   number_of_zctas_assigned_to_wedges = nrow(zcta_wedge_crosswalk),
   number_of_wedge_pairs_with_two_sides = sum(wedge_pair_sides$n_sides == 2),
   number_of_wedge_pairs_missing_one_side = sum(wedge_pair_sides$n_sides < 2),
@@ -417,7 +438,7 @@ border_wedge_diagnostics <- tibble(
 
 write_csv(
   border_wedge_diagnostics,
-  "data/temp/border_wedge_diagnostics.csv"
+  temp_csv_path("border_wedge_diagnostics")
 )
 
 # 5. Clean state tax controls and ZIP-year outcomes/controls.
@@ -531,7 +552,7 @@ zipcode_market_potential <- compute_market_potential(
 
 write_csv(
   zipcode_market_potential,
-  "data/temp/zipcode_market_potential_2015_2022.csv"
+  temp_csv_path("zipcode_market_potential_2015_2022")
 )
 
 # 8. Wedge MP: focal wedge point to other ZIP payroll masses within 1000 km.
@@ -553,7 +574,7 @@ wedge_market_potential <- compute_market_potential(
 
 write_csv(
   wedge_market_potential,
-  "data/temp/wedge_market_potential_2015_2022.csv"
+  temp_csv_path("wedge_market_potential_2015_2022")
 )
 
 # 9. Build ZIP-year-wedge panel and fill missing establishment/payroll as zero.
@@ -579,10 +600,18 @@ required_zip_cols <- c(
 )
 
 # Drop ZIP-year rows missing required controls or market potential.
+# Last full run attrition:
+#   before this filter: 62,920 ZIP-year rows = 7,865 assigned ZIPs x 8 years
+#   after this filter:  62,014 ZIP-year rows
+#   removed here:          906 ZIP-year rows with missing required fields
 zipcode_year_wedge <- zipcode_year_wedge |>
   filter(if_all(all_of(required_zip_cols), ~ !is.na(.x)))
 
 # Keep only ZIP-wedge units observed in all years.
+# Last full run attrition:
+#   after required-field filter: 62,014 ZIP-year rows
+#   after balance filter:        61,712 ZIP-year rows = 7,714 ZIPs x 8 years
+#   removed here:                   302 ZIP-year rows, corresponding to 151 ZIPs
 balanced_zip_ids <- zipcode_year_wedge |>
   group_by(zipcode, wedge_id) |>
   summarise(n_years = n_distinct(year), .groups = "drop") |>
@@ -605,7 +634,7 @@ if (any(zip_balance_check$n_rows != length(years))) {
 
 write_csv(
   zipcode_year_wedge,
-  "data/temp/zipcode_year_wedge_balanced_2015_2022.csv"
+  temp_csv_path("zipcode_year_wedge_balanced_2015_2022")
 )
 
 # 10. Aggregate balanced ZIP data to wedge-year level.
@@ -636,6 +665,10 @@ wedge_year <- zipcode_year_wedge |>
   filter(!is.na(wedge_market_potential))
 
 # Keep only wedges observed in all years.
+# Last full run attrition:
+#   possible wedge-year rows from retained ZIP sample: 14,760 = 1,845 wedges x 8 years
+#   final wedge-year rows:                            14,760
+#   removed here:                                          0 wedge-year rows
 balanced_wedge_ids <- wedge_year |>
   group_by(wedge_id) |>
   summarise(n_years = n_distinct(year), .groups = "drop") |>
@@ -685,10 +718,11 @@ if (
 
 write_csv(
   wedge_year,
-  "data/temp/wedge_year_balanced_2015_2022.csv"
+  temp_csv_path("wedge_year_balanced_2015_2022")
 )
 
 # 11. Report final panel sizes.
 message("Done.")
+message("Buffer suffix: ", buffer_suffix)
 message("ZIP-year-wedge rows: ", nrow(zipcode_year_wedge))
 message("Wedge-year rows: ", nrow(wedge_year))
