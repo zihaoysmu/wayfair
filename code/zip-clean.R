@@ -36,6 +36,15 @@ adoption_year_from_abbr <- function(state_abbr) {
   )
 }
 
+employment_midpoints <- tibble(
+  empszes = c("210", "212", "220", "230", "241", "242", "251", "252", "254", "260"),
+  emp_midpoint = c(2.5, 2.5, 7, 14.5, 34.5, 74.5, 174.5, 374.5, 749.5, 1500)
+)
+
+retailer_categories <- c("online retailer", "local retailer", "warehouse")
+estab_cols <- c("online_estab", "local_estab", "warehouse_estab")
+emp_hat_cols <- c("online_emp_hat", "local_emp_hat", "warehouse_emp_hat")
+
 make_state_pair_borders <- function(states_sf) {
   state_neighbors <- st_touches(states_sf)
   state_pairs <- rbindlist(lapply(seq_along(state_neighbors), function(i) {
@@ -230,20 +239,116 @@ cit <- read_xlsx("data/raw/us_state_corporate_tax.xlsx") |>
   select(state_abbr, year, cit) |>
   distinct()
 
-retailer <- read_csv(
+retailer_raw <- read_csv(
   "data/temp/zbp_retailer_2015_2022.csv",
   col_types = cols(.default = col_guess(), zipcode = col_character())
 ) |>
   clean_names() |>
-  filter(empszes_label == "All establishments") |>
   mutate(
     year = as.integer(year),
     zipcode = str_pad(as.character(zipcode), width = 5, side = "left", pad = "0"),
     estab = as.numeric(estab),
+    empszes = as.character(empszes)
+  )
+
+payroll_raw <- read_csv(
+  "data/temp/zbp_payroll_2015_2022.csv",
+  col_types = cols(.default = col_guess(), zipcode = col_character())
+) |>
+  clean_names()
+
+if (!"emp" %in% names(payroll_raw)) {
+  stop("zbp_payroll_2015_2022.csv does not include EMP. Re-run code/zip-estab_and_payroll-api.R.")
+}
+
+payroll <- payroll_raw |>
+  mutate(
+    year = as.integer(year),
+    zipcode = str_pad(as.character(zipcode), width = 5, side = "left", pad = "0"),
+    payann = as.numeric(payann),
+    emp = as.numeric(emp)
+  ) |>
+  group_by(zipcode, year) |>
+  summarise(
+    payann = sum(payann, na.rm = TRUE),
+    emp = sum(emp, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+all_sector_size_path <- "data/temp/zbp_all_sector_size_2015_2022.csv"
+if (!file.exists(all_sector_size_path)) {
+  stop("Missing ", all_sector_size_path, ". Re-run code/zip-estab_and_payroll-api.R.")
+}
+
+all_sector_size <- read_csv(
+  all_sector_size_path,
+  col_types = cols(.default = col_guess(), zipcode = col_character())
+) |>
+  clean_names() |>
+  mutate(
+    year = as.integer(year),
+    zipcode = str_pad(as.character(zipcode), width = 5, side = "left", pad = "0"),
+    estab = as.numeric(estab),
+    empszes = as.character(empszes)
+  )
+
+missing_retailer_midpoints <- retailer_raw |>
+  filter(empszes != "001", !is.na(estab), estab != 0) |>
+  anti_join(employment_midpoints, by = "empszes") |>
+  distinct(empszes, empszes_label)
+if (nrow(missing_retailer_midpoints) > 0) {
+  stop("Missing employment midpoint for retailer EMPSZES code(s): ", paste(missing_retailer_midpoints$empszes, collapse = ", "))
+}
+
+missing_all_sector_midpoints <- all_sector_size |>
+  filter(empszes != "001", !is.na(estab), estab != 0) |>
+  anti_join(employment_midpoints, by = "empszes") |>
+  distinct(empszes, empszes_label)
+if (nrow(missing_all_sector_midpoints) > 0) {
+  stop("Missing employment midpoint for all-sector EMPSZES code(s): ", paste(missing_all_sector_midpoints$empszes, collapse = ", "))
+}
+
+all_sector_midpoint_emp <- all_sector_size |>
+  filter(empszes != "001") |>
+  left_join(employment_midpoints, by = "empszes") |>
+  mutate(emp_hat_midpoint_total = estab * emp_midpoint) |>
+  group_by(zipcode, year) |>
+  summarise(emp_hat_midpoint_total = sum(emp_hat_midpoint_total, na.rm = TRUE), .groups = "drop")
+
+employment_calibration <- payroll |>
+  select(zipcode, year, emp_true_total = emp) |>
+  left_join(all_sector_midpoint_emp, by = c("zipcode", "year")) |>
+  mutate(
+    emp_hat_midpoint_total = replace_na(emp_hat_midpoint_total, 0),
+    emp_calibration_factor = case_when(
+      emp_hat_midpoint_total > 0 & !is.na(emp_true_total) ~ emp_true_total / emp_hat_midpoint_total,
+      emp_hat_midpoint_total == 0 & replace_na(emp_true_total, 0) == 0 ~ 1,
+      TRUE ~ NA_real_
+    )
+  )
+
+employment_calibration_diagnostics <- employment_calibration |>
+  summarise(
+    n_zip_years = n(),
+    n_missing_factor = sum(is.na(emp_calibration_factor)),
+    emp_calibration_factor_min = min(emp_calibration_factor, na.rm = TRUE),
+    emp_calibration_factor_p50 = median(emp_calibration_factor, na.rm = TRUE),
+    emp_calibration_factor_max = max(emp_calibration_factor, na.rm = TRUE)
+  )
+
+write_csv(
+  employment_calibration_diagnostics,
+  "data/temp/zipcode_emp_calibration_diagnostics_2015_2022.csv"
+)
+
+retailer_estab <- retailer_raw |>
+  filter(empszes_label == "All establishments", naics %in% retailer_categories) |>
+  mutate(
     naics = recode(
       naics,
       "online retailer" = "online_estab",
-      "local retailer" = "local_estab"
+      "local retailer" = "local_estab",
+      "warehouse" = "warehouse_estab"
     )
   ) |>
   group_by(zipcode, year, naics) |>
@@ -254,18 +359,49 @@ retailer <- read_csv(
     values_fill = 0
   )
 
-payroll <- read_csv(
-  "data/temp/zbp_payroll_2015_2022.csv",
-  col_types = cols(.default = col_guess(), zipcode = col_character())
-) |>
-  clean_names() |>
+for (estab_col in estab_cols) {
+  if (!estab_col %in% names(retailer_estab)) retailer_estab[[estab_col]] <- 0
+}
+
+retailer_emp <- retailer_raw |>
+  filter(empszes != "001", naics %in% retailer_categories) |>
+  left_join(employment_midpoints, by = "empszes") |>
   mutate(
-    year = as.integer(year),
-    zipcode = str_pad(as.character(zipcode), width = 5, side = "left", pad = "0"),
-    payann = as.numeric(payann)
+    emp_hat_raw = estab * emp_midpoint,
+    naics = recode(
+      naics,
+      "online retailer" = "online_emp_hat",
+      "local retailer" = "local_emp_hat",
+      "warehouse" = "warehouse_emp_hat"
+    )
   ) |>
-  group_by(zipcode, year) |>
-  summarise(payann = sum(payann, na.rm = TRUE), .groups = "drop")
+  group_by(zipcode, year, naics) |>
+  summarise(emp_hat_raw = sum(emp_hat_raw, na.rm = TRUE), .groups = "drop") |>
+  left_join(
+    employment_calibration |> select(zipcode, year, emp_calibration_factor),
+    by = c("zipcode", "year")
+  ) |>
+  mutate(emp_hat = emp_hat_raw * coalesce(emp_calibration_factor, 1)) |>
+  select(zipcode, year, naics, emp_hat) |>
+  pivot_wider(
+    names_from = naics,
+    values_from = emp_hat,
+    values_fill = 0
+  )
+
+for (emp_col in emp_hat_cols) {
+  if (!emp_col %in% names(retailer_emp)) retailer_emp[[emp_col]] <- 0
+}
+
+retailer <- retailer_estab |>
+  full_join(retailer_emp, by = c("zipcode", "year"))
+
+for (estab_col in estab_cols) {
+  if (!estab_col %in% names(retailer)) retailer[[estab_col]] <- 0
+}
+for (emp_col in emp_hat_cols) {
+  if (!emp_col %in% names(retailer)) retailer[[emp_col]] <- 0
+}
 
 population <- read_csv(
   "data/temp/acs5_zipcode_population_2015_2022.csv",
@@ -308,7 +444,12 @@ zipcode_year_pair <- zipcode_pair_crosswalk |>
   mutate(
     online_estab = replace_na(online_estab, 0),
     local_estab = replace_na(local_estab, 0),
+    warehouse_estab = replace_na(warehouse_estab, 0),
+    online_emp_hat = replace_na(online_emp_hat, 0),
+    local_emp_hat = replace_na(local_emp_hat, 0),
+    warehouse_emp_hat = replace_na(warehouse_emp_hat, 0),
     payann = replace_na(payann, 0),
+    emp = replace_na(emp, 0),
     tax_diff = sales_tax - tax_other,
     high_tax_dummy = if_else(
       !is.na(sales_tax) & !is.na(tax_other),

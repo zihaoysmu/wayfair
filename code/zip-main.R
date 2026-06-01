@@ -13,9 +13,9 @@ dir.create("output/figures", recursive = TRUE, showWarnings = FALSE)
 # ZIP year-by-year 2x2 models ----
 years <- sort(unique(zip_pair$year))
 
-# Prepare numeric variables and compute establishment changes within each
-# ZIP-pair history. The lag is grouped by both zipcode and zip_pair_id so that
-# a ZIP duplicated across multiple border pairs gets a separate change series.
+# Prepare numeric variables and compute establishment changes/growth within
+# each ZIP-pair history. The lag is grouped by both zipcode and zip_pair_id so
+# that a ZIP duplicated across multiple border pairs gets a separate series.
 zip_model_data <- zip_pair %>%
     mutate(
         online_estab = as.numeric(online_estab),
@@ -27,18 +27,27 @@ zip_model_data <- zip_pair %>%
     ) %>%
     arrange(zipcode, zip_pair_id, year) %>%
     group_by(zipcode, zip_pair_id) %>%
-    mutate(d_online_estab = online_estab - lag(online_estab)) %>%
+    mutate(
+        online_estab_lag = lag(online_estab),
+        d_online_estab = online_estab - online_estab_lag,
+        g_online_estab = if_else(
+            !is.na(online_estab_lag) & online_estab_lag != 0,
+            d_online_estab / online_estab_lag,
+            NA_real_
+        )
+    ) %>%
     ungroup()
 
-# Outcomes: OLS uses the change in online establishments, while PPML uses the
-# establishment level and later reports the treatment effect as exp(beta) - 1.
+# Outcomes: OLS uses establishment changes and growth rates, while PPML uses
+# the establishment level and later reports the treatment effect as exp(beta)-1.
 zip_outcomes <- tibble(
-    outcome = c("d_online_estab", "online_estab"),
+    outcome = c("d_online_estab", "g_online_estab", "online_estab"),
     outcome_label = c(
         "Change in online establishments",
+        "Growth rate of online establishments",
         "Online establishments (PPML proportional effect)"
     ),
-    model_type = c("OLS", "PPML")
+    model_type = c("OLS", "OLS", "PPML")
 )
 
 # Treatments for the 2x2 figure rows. The sales tax coefficient is rescaled to
